@@ -35,6 +35,7 @@ pub mod image_gen;
 pub mod image_info;
 pub mod jira_tool;
 pub mod knowledge_tool;
+pub mod lcm_grep;
 pub mod linkedin;
 pub mod linkedin_client;
 pub mod llm_task;

@@ -19,6 +19,7 @@ use zeroclaw_config::schema::SearchMode;
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// A row from the immutable `messages` table.
+#[derive(Debug)]
 pub struct MessageEntry {
     pub id: String,
     pub session_id: String,
@@ -176,6 +177,26 @@ impl SqliteMemory {
         } else {
             Connection::open(&path_buf).context("SQLite failed to open database")?
         };
+
+        // Register `regexp(pattern, value)` user-defined function so that
+        // `content REGEXP ?` works in queries.
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern: String = ctx.get(0)?;
+                let value: String = ctx.get(1)?;
+                let re = regex::Regex::new(&pattern).map_err(|e| {
+                    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        e.to_string(),
+                    )))
+                })?;
+                Ok(re.is_match(&value) as i32)
+            },
+        )?;
 
         Ok(conn)
     }
@@ -425,6 +446,73 @@ impl SqliteMemory {
                  LIMIT ?2",
             )?;
             stmt.query_map(params![fts_query, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        };
+
+        Ok(results)
+    }
+
+    /// Regex search over the full verbatim message history.
+    ///
+    /// Uses the `regexp(pattern, value)` SQLite UDF registered at connection
+    /// open time.  The pattern is validated via `regex::Regex::new()` before
+    /// the query executes so that an invalid regex returns an error rather
+    /// than a confusing SQLite error.
+    ///
+    /// Each result includes a `summary_id` (Some when the message was covered
+    /// by a summary, None when still "active").
+    pub fn grep_messages(
+        &self,
+        pattern: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEntry>> {
+        // Validate regex first so callers get a clean error.
+        regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+
+        let conn = self.conn.lock();
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| {
+            Ok(MessageEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                summary_id: row.get(5)?,
+            })
+        };
+
+        let results = if let Some(sid) = session_id {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                        ss.summary_id
+                 FROM messages m
+                 LEFT JOIN summary_sources ss
+                        ON ss.source_id = m.id AND ss.source_kind = 'message'
+                 WHERE m.content REGEXP ?1
+                   AND m.session_id = ?2
+                 ORDER BY m.created_at DESC
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![pattern, sid, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                        ss.summary_id
+                 FROM messages m
+                 LEFT JOIN summary_sources ss
+                        ON ss.source_id = m.id AND ss.source_kind = 'message'
+                 WHERE m.content REGEXP ?1
+                 ORDER BY m.created_at DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![pattern, limit_i64], row_mapper)?
                 .filter_map(std::result::Result::ok)
                 .collect()
         };
@@ -3348,5 +3436,96 @@ mod tests {
         mem.insert_summary("c1", "condensed", "condensed content", None, "session-count", 1).unwrap();
 
         assert_eq!(mem.count_leaf_summaries("session-count").unwrap(), 2, "condensed not counted");
+    }
+
+    // ── lcm_grep / grep_messages tests (Phase 5) ─────────────────
+
+    fn append_msg(mem: &SqliteMemory, id: &str, session: &str, role: &str, content: &str) {
+        mem.append_message(id, session, role, content, None).unwrap();
+    }
+
+    #[test]
+    fn regexp_function_registered_on_connection() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let conn = mem.conn.lock();
+        let result: i32 = conn
+            .query_row("SELECT regexp('abc', 'xabcx')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(result, 1, "regexp should match");
+        let no_match: i32 = conn
+            .query_row("SELECT regexp('xyz', 'hello')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(no_match, 0, "regexp should not match");
+    }
+
+    #[test]
+    fn lcm_grep_basic_match() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        append_msg(&mem, "m1", "sess1", "user", "hello world");
+        append_msg(&mem, "m2", "sess1", "assistant", "hi there");
+
+        let results = mem.grep_messages("hello", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "m1");
+        assert!(results[0].content.contains("hello world"));
+    }
+
+    #[test]
+    fn lcm_grep_session_filter() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        append_msg(&mem, "m1", "sess-a", "user", "hello from session a");
+        append_msg(&mem, "m2", "sess-b", "user", "hello from session b");
+
+        let results = mem.grep_messages("hello", Some("sess-a"), 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "sess-a");
+    }
+
+    #[test]
+    fn lcm_grep_invalid_regex_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let err = mem.grep_messages("[unclosed", None, 20);
+        assert!(err.is_err(), "invalid regex should return Err");
+        assert!(err.unwrap_err().to_string().contains("invalid regex"));
+    }
+
+    #[test]
+    fn lcm_grep_respects_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        for i in 0..30 {
+            append_msg(&mem, &format!("m{i}"), "sess", "user", &format!("match me {i}"));
+        }
+        let results = mem.grep_messages("match me", None, 5).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn lcm_grep_summary_annotation() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        append_msg(&mem, "msg-covered", "sess", "user", "findable content");
+        // Simulate a summary covering this message
+        mem.insert_summary("sum1", "leaf", "compressed", None, "sess", 1).unwrap();
+        mem.link_summary_sources("sum1", &[("msg-covered", "message")]).unwrap();
+
+        let results = mem.grep_messages("findable", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary_id.as_deref(), Some("sum1"), "should be annotated with summary_id");
+    }
+
+    #[test]
+    fn lcm_grep_active_message_has_no_summary() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        append_msg(&mem, "msg-active", "sess", "user", "active content here");
+
+        let results = mem.grep_messages("active content", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].summary_id.is_none(), "active message should have no summary_id");
     }
 }

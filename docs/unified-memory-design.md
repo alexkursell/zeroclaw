@@ -1435,6 +1435,36 @@ async fn lcm_grep_tool_returns_formatted_results() {
 
 **Deliverable:** The agent can do forensic regex search over its full verbatim history. Results are annotated with whether the message has been compacted.
 
+#### Implementation Notes
+
+Implemented 2026-04-13. All changes on branch `better-memory`.
+
+**`sqlite.rs` — `regexp` UDF registration:**
+- Added `functions` feature to `rusqlite` in `Cargo.toml`.
+- `open_connection()` now calls `conn.create_scalar_function("regexp", 2, ...)` with flags `SQLITE_UTF8 | SQLITE_DETERMINISTIC` immediately after opening. The UDF compiles the pattern via `regex::Regex::new()` and returns `1` or `0` as `i32`.
+- This makes `content REGEXP ?` valid SQL on every connection opened by `SqliteMemory`.
+
+**`sqlite.rs` — `grep_messages()` method:**
+- Validates the regex via `regex::Regex::new(pattern)` before executing SQL — invalid patterns return `anyhow::Error` with "invalid regex" prefix rather than propagating a confusing rusqlite error.
+- Uses the query from the spec: `LEFT JOIN summary_sources ss ON ss.source_id = m.id AND ss.source_kind = 'message'` so that `summary_id` is populated for compacted messages and NULL for active ones.
+- Supports `session_id` filter (two query paths) and `limit`.
+- `MessageEntry` gained `#[derive(Debug)]` (needed for test assertions).
+
+**`lcm_grep.rs` — `LcmGrepTool`:**
+- `new(sqlite: Arc<SqliteMemory>)` constructor.
+- Enforces `MAX_LIMIT = 50` regardless of caller input.
+- Formats results as: `[{created_at}] {role}: {content}\n({covered by summary <id> | active})`.
+- Invalid regex returns `success: false` with the error message forwarded to the LLM.
+- Empty result set returns `success: true` with "No messages matched" message.
+
+**`lib.rs`:** Added `pub mod lcm_grep;` declaration.
+
+**Tests added:**
+- `sqlite.rs` (7 new): `regexp_function_registered_on_connection`, `lcm_grep_basic_match`, `lcm_grep_session_filter`, `lcm_grep_invalid_regex_returns_error`, `lcm_grep_respects_limit`, `lcm_grep_summary_annotation`, `lcm_grep_active_message_has_no_summary`.
+- `lcm_grep.rs` (6 tests): `lcm_grep_tool_returns_formatted_results`, `lcm_grep_tool_no_match`, `lcm_grep_tool_invalid_regex`, `lcm_grep_tool_limit_respected`, `lcm_grep_tool_missing_pattern`, `name_and_schema`.
+
+**Results:** 318 memory tests + 1103 tool tests pass. 0 failures.
+
 ---
 
 ### Phase 6: Dream Cycle
