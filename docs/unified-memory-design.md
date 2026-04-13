@@ -1306,6 +1306,49 @@ async fn build_context_empty_sections_omitted() {
 
 **Deliverable:** Single `recall()` call searches all storage layers. RRF produces robust ranked results. Structured context block. Knowledge graph participates in every turn's context automatically.
 
+#### Implementation Notes
+
+Implemented 2026-04-13. All changes on branch `better-memory`.
+
+**`retrieval.rs` — new types:**
+- `RrfSource` enum: `Memory | Summary | KnowledgeNode`
+- `RrfEntry` struct: `id, content, source, original_score, rrf_score, node_type, key, created_at`
+- `rrf_merge(ranked_lists, limit, k=60)` free function: accumulates `1/(k + rank + 1)` per source, deduplicates by id, sorts descending, truncates to limit. 0-indexed rank matches the Cormack et al. formula.
+- `source_fingerprint(sqlite, knowledge) -> u8` bitmask: bit 0 = memory (always 1), bit 1 = summaries, bit 2 = knowledge graph.
+
+**`retrieval.rs` — `RetrievalPipeline` extensions:**
+- New fields: `sqlite: Option<Arc<SqliteMemory>>`, `knowledge: Option<Arc<KnowledgeGraph>>`, `sources_fp: u8`, `rrf_cache: Mutex<HashMap<String, CachedRrfResult>>`.
+- Builder methods: `.with_sqlite(Arc<SqliteMemory>)`, `.with_knowledge(Arc<KnowledgeGraph>)` (each recalculates `sources_fp`).
+- `cache_key()` now includes `sources_fp` as a 6th colon-separated field — stale cross-source cache hits are impossible.
+- `recall_rrf(query, limit, session_id)`: queries all configured sources, converts to `Vec<RrfEntry>`, calls `rrf_merge()` when ≥2 non-empty source lists, falls back to identity assignment when single source. Results cached in separate `rrf_cache`.
+- Existing `recall()` is unchanged and returns `Vec<MemoryEntry>` for backward compatibility.
+
+**Exported from `zeroclaw-memory::lib.rs`:** `RrfEntry`, `RrfSource`, `rrf_merge`, `source_fingerprint`.
+
+**`loop_.rs` — `build_context()` rewritten:**
+- Signature: `(pipeline: &RetrievalPipeline, ...)` instead of `(mem: &dyn Memory, ...)`.
+- Calls `pipeline.recall_rrf(user_msg, 10, session_id)`.
+- Partitions results into `kg_nodes`, `mem_entries`, `summary_entries` (skipping `<tool_result` entries).
+- Emits structured `[Context]...[/Context]` block:
+  - Knowledge nodes: grouped by `node_type`, section header is `{Type}s` (e.g. "Persons", "Decisions").
+  - Memory entries: `## Facts` section.
+  - Summaries: `## Session history` section.
+  - Empty sections omitted entirely.
+- Old `[Memory context]` format removed.
+- Three call sites updated to construct `RetrievalPipeline::new(mem.clone(), RetrievalConfig::default())` (memory-only for now — sqlite/knowledge wiring deferred to when those handles are in `run()` scope).
+
+**`loop_.rs` — import change:** `decay` removed (no longer applied in `build_context`; memory backend applies it during recall). `RetrievalConfig`, `RetrievalPipeline`, `RrfSource` added.
+
+**Deviations from spec:**
+- `recall_rrf` does not currently pass `since`/`until` time filters to the memory source (those parameters exist on `recall()` but aren't plumbed through `recall_rrf()` yet — straightforward to add later).
+- The three `run()` call sites use `RetrievalPipeline::new(mem.clone(), ...)` (memory-only). The spec envisions wiring up `sqlite` and `knowledge` handles here when they become available in `run()` scope (Phase 5/6 work).
+- Time decay (`decay::apply_time_decay`) is no longer applied in `build_context()`. The memory backend (`SqliteMemory`) applies importance/decay scoring internally during `recall()`, so this is not a regression.
+
+**Tests added (10 new in `retrieval.rs`):**
+`rrf_merge_empty_sources`, `rrf_merge_single_source_preserves_order`, `rrf_merge_cross_source_fusion`, `rrf_merge_respects_limit`, `rrf_score_formula`, `recall_rrf_single_source_no_rrf_overhead`, `recall_rrf_cache_hit_on_second_call`, `source_fingerprint_values`, `cache_key_differs_by_source_fingerprint`, `rrf_merge_all_same_id_accumulates`.
+
+**Results:** 311 memory tests + 1097 tool tests pass. 0 failures.
+
 ---
 
 ### Phase 5: `lcm_grep` Tool

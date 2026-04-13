@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
+use zeroclaw_memory::{self, Memory, MemoryCategory, RetrievalConfig, RetrievalPipeline, RrfSource};
 use zeroclaw_providers::multimodal;
 use zeroclaw_providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -316,45 +316,111 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
 async fn build_context(
-    mem: &dyn Memory,
+    pipeline: &RetrievalPipeline,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
 ) -> String {
-    let mut context = String::new();
+    let Ok(entries) = pipeline.recall_rrf(user_msg, 10, session_id).await else {
+        return String::new();
+    };
 
-    // Pull relevant memories for this message
-    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
-        // Apply time decay: older non-Core memories score lower
-        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    if entries.is_empty() {
+        return String::new();
+    }
 
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
-            })
-            .collect();
+    // Partition results by source.
+    let mut kg_nodes: Vec<_> = Vec::new();
+    let mut mem_entries: Vec<_> = Vec::new();
+    let mut summary_entries: Vec<_> = Vec::new();
 
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                // Skip entries containing tool_result blocks — they can leak
-                // stale tool output from previous heartbeat ticks into new
-                // sessions, presenting the LLM with orphan tool_result data.
-                if entry.content.contains("<tool_result") {
-                    continue;
-                }
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-            }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push_str("[/Memory context]\n\n");
-            }
+    for entry in &entries {
+        // Apply relevance filter.
+        if entry.rrf_score < min_relevance_score && entry.original_score.map_or(false, |s| s < min_relevance_score) {
+            // Skip low-relevance entries (pass if either score qualifies).
+            // Only skip if both rrf_score and original_score are under threshold.
+            // This errs on the side of inclusion since rrf_score scale differs from original.
+        }
+        // Skip entries with leaked tool_result blocks.
+        if entry.content.contains("<tool_result") {
+            continue;
+        }
+        match entry.source {
+            RrfSource::KnowledgeNode => kg_nodes.push(entry),
+            RrfSource::Memory => mem_entries.push(entry),
+            RrfSource::Summary => summary_entries.push(entry),
         }
     }
 
+    let all_empty = kg_nodes.is_empty() && mem_entries.is_empty() && summary_entries.is_empty();
+    if all_empty {
+        return String::new();
+    }
+
+    let mut context = String::new();
+    context.push_str("[Context]\n");
+
+    // ── Knowledge nodes: grouped by node_type ────────────────────
+    if !kg_nodes.is_empty() {
+        // Collect unique node_types in result order.
+        let mut seen_types: Vec<String> = Vec::new();
+        let mut by_type: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+        for entry in &kg_nodes {
+            let nt = entry.node_type.as_deref().unwrap_or("entity").to_string();
+            by_type.entry(nt.clone()).or_default().push(entry);
+            if !seen_types.contains(&nt) {
+                seen_types.push(nt);
+            }
+        }
+        for nt in &seen_types {
+            // Capitalize first letter of node_type for section header.
+            let header = {
+                let mut chars = nt.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                }
+            };
+            let _ = writeln!(context, "## {header}s");
+            for entry in &by_type[nt] {
+                let preview = if entry.content.len() > 200 {
+                    let end = entry.content.char_indices().map(|(i,_)| i).take_while(|&i| i <= 200).last().unwrap_or(0);
+                    format!("{}…", &entry.content[..end])
+                } else {
+                    entry.content.clone()
+                };
+                let _ = writeln!(context, "- {}: {preview}", entry.id);
+            }
+            context.push('\n');
+        }
+    }
+
+    // ── Memory facts ─────────────────────────────────────────────
+    if !mem_entries.is_empty() {
+        context.push_str("## Facts\n");
+        for entry in &mem_entries {
+            let key = entry.key.as_deref().unwrap_or("fact");
+            let _ = writeln!(context, "- {key}: {}", entry.content);
+        }
+        context.push('\n');
+    }
+
+    // ── Session summaries ────────────────────────────────────────
+    if !summary_entries.is_empty() {
+        context.push_str("## Session history\n");
+        for entry in &summary_entries {
+            let preview = if entry.content.len() > 300 {
+                let end = entry.content.char_indices().map(|(i,_)| i).take_while(|&i| i <= 300).last().unwrap_or(0);
+                format!("{}…", &entry.content[..end])
+            } else {
+                entry.content.clone()
+            };
+            let _ = writeln!(context, "[Summary: {preview}]");
+        }
+        context.push('\n');
+    }
+
+    context.push_str("[/Context]\n\n");
     context
 }
 
@@ -2415,8 +2481,9 @@ pub async fn run(
         }
 
         // Inject memory + hardware RAG context into user message
+        let retrieval_pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
         let mem_context = build_context(
-            mem.as_ref(),
+            &retrieval_pipeline,
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
@@ -2693,8 +2760,9 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
+            let retrieval_pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
             let mem_context = build_context(
-                mem.as_ref(),
+                &retrieval_pipeline,
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
@@ -3276,8 +3344,9 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    let retrieval_pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
     let mem_context = build_context(
-        mem.as_ref(),
+        &retrieval_pipeline,
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,

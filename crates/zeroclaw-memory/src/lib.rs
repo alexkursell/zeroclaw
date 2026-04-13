@@ -39,7 +39,7 @@ pub use policy::PolicyEnforcer;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
-pub use retrieval::{RetrievalConfig, RetrievalPipeline};
+pub use retrieval::{RetrievalConfig, RetrievalPipeline, RrfEntry, RrfSource, rrf_merge, source_fingerprint};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
