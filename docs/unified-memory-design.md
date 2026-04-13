@@ -2192,4 +2192,27 @@ Each step in this test is a checkpoint: if it fails, the failure message indicat
 
 ---
 
+### 9.4 Implementation Notes
+
+**File:** `tests/integration/memory_pipeline.rs` (new). Registered in `tests/integration/mod.rs`.
+
+**Production change:** `build_context()` in `crates/zeroclaw-runtime/src/agent/loop_.rs` changed from `async fn` to `pub async fn` and added to `pub use loop_::` in `agent/mod.rs`. Required so Group 3 tests can call it directly from the integration test binary. No logic changes.
+
+**Pre-existing fix:** Two calls to `consolidate_turn` in `tests/integration/memory_loop_continuity.rs` were missing the `knowledge: Option<&KnowledgeGraph>` arg added in Phase 3. Fixed by passing `None`.
+
+**Infrastructure:**
+- `AxisEmbedder` — 8-dimensional deterministic embedder; keyword→axis mapping configured at construction time. Implements `EmbeddingProvider` via `async_trait`. Used so `SqliteMemory::with_embedder()` gets a non-noop embedder for tests that exercise vector paths.
+- `MemoryWorld` — three constructors (`empty()`, `standard()`, `keyword_only()`). Standard corpus: 3 KG nodes (alice/acme/consensus_rewrite), 2 edges, 9 node events, 6 Core facts, 4 Daily memories, 10 messages (5 per session), 1 Session A leaf summary, 1 Session B summary.
+- `scripted_response(text)` — builds a `ChatResponse` with `.text = Some(text)` for use with `MockProvider` in consolidation calls.
+
+**FTS5 behavior note:** `query_by_similarity()` in `KnowledgeGraph` wraps each query token in double-quotes (phrase search) and ANDs them. Queries with multiple tokens only match nodes where ALL tokens appear in title/content/tags. Tests that exercise KG recall use single-token queries ("alice") to avoid false negatives. `update_synthesis()` does not update `nodes_fts` — synthesis text is not indexed for FTS, only for storage and direct node access.
+
+**Session B summary:** The design doc standard corpus only specifies one Session A summary. An additional Session B summary mentioning "weather" was added to make `session_b_messages_absent_from_session_a_recall` non-trivial (the test verifies it's filtered by session_id).
+
+**Compression simulation:** Group 5 step 3 ("Compression — Phase 2") calls `insert_summary()` and `link_summary_sources()` directly instead of running `ContextCompressor.compress_if_needed()`. This keeps the test deterministic and avoids the token-estimation and LLM-summarization machinery. The summary DAG invariants (leaf summary row, source links, pipeline recall, grep annotation) are fully verified.
+
+**Results:** 22 integration tests pass. 0 failures. Groups 1–5 all green.
+
+---
+
 *End of design document.*

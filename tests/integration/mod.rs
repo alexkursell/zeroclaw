@@ -1,4 +1,5 @@
 mod agent;
+mod memory_pipeline;
 mod agent_robustness;
 mod backup_cron_scheduling;
 mod channel_matrix;

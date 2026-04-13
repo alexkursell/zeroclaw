@@ -456,6 +456,7 @@ async fn consolidation_extracts_facts_to_memory() {
         &provider,
         "test-model",
         mem.as_ref(),
+        None,
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
     )
@@ -487,6 +488,7 @@ async fn memory_survives_rapid_consolidation() {
             &provider,
             "test-model",
             mem.as_ref(),
+            None,
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
         )

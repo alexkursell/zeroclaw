@@ -315,7 +315,7 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
-async fn build_context(
+pub async fn build_context(
     pipeline: &RetrievalPipeline,
     user_msg: &str,
     min_relevance_score: f64,
