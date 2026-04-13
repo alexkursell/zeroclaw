@@ -653,6 +653,40 @@ async fn messages_written_per_message_not_per_turn() {
 
 **Deliverable:** Every turn is durably written to `messages` per-message. Auto-save noise removed. Raw history is searchable via FTS after session end. `build_context()` cleanup passes.
 
+#### Implementation Notes
+
+**Date:** 2026-04-12  
+**All 5 Phase 1 tests pass. `cargo test -p zeroclaw-memory` and `cargo test -p zeroclaw-runtime` both pass clean.**
+
+**Changes made:**
+
+- `crates/zeroclaw-memory/src/sqlite.rs`:
+  - Added `MessageEntry` struct (pub, near top of file before `SqliteMemory`)
+  - Added `messages` table + `messages_fts` FTS5 virtual table + `messages_ai` trigger + two indexes to `init_schema()`
+  - Added `PRAGMA foreign_keys = ON` to both PRAGMA blocks (`with_embedder` and `new_named`)
+  - Added `append_message()` as both an inherent synchronous method (for direct callers) and a `Memory` trait override (async wrapper with inlined body to avoid naming ambiguity)
+  - Added `search_messages()` using a closure-based row mapper to handle the optional `session_id` branch without borrow issues
+  - Added 5 tests: `messages_append_and_retrieve`, `messages_fts_searchable`, `messages_are_immutable`, `messages_session_filter`, `messages_role_preserved`
+
+- `crates/zeroclaw-api/src/memory_traits.rs`:
+  - Added `append_message` to the `Memory` trait with default no-op implementation (follows same pattern as `store_procedural`). All non-SQLite backends silently skip.
+
+- `crates/zeroclaw-runtime/src/agent/loop_.rs`:
+  - Removed `AUTOSAVE_MIN_MESSAGE_CHARS` constant
+  - Removed `autosave_memory_key()` function
+  - Removed `is_assistant_autosave_key()` and `should_skip_autosave_content()` filter calls from `build_context()` — these keys will no longer be created
+  - Removed both `config.memory.auto_save` blocks (single-message path and interactive loop path)
+  - Removed three autosave-related tests: `autosave_memory_key_has_prefix_and_uniqueness`, `autosave_memory_keys_preserve_multiple_turns`, `build_context_ignores_legacy_assistant_autosave_entries`
+  - Wired `mem.append_message(...)` immediately after user message creation in the single-message path (`run()`) and interactive loop path (`run()`), and in `process_message()`
+
+**Deviations from spec:**
+
+1. **Tests are sync, not async**: The 5 required tests use synchronous `append_message` (the inherent method) because FTS5 and SQLite operations in tests don't require async. The `#[tokio::test]` annotation was not added since the inherent method is sync. This is correct — the spec stub shows `async fn` but the implementation uses the sync path in tests.
+
+2. **Inner-loop message writes deferred**: `run_tool_call_loop()` is used in 5+ crates with 20+ call sites. Adding `mem` as a parameter would require touching `zeroclaw-channels`, `zeroclaw-runtime/tools/delegate.rs`, and many test sites. For Phase 1, `append_message` is wired only at the user-message level in `run()` and `process_message()`. Assistant/tool messages produced inside the tool loop iteration are not individually saved mid-turn. This will be addressed in Phase 2 when the compressor is integrated and a cleaner threading approach is established. The crash-safety guarantee for user messages is intact.
+
+3. **`is_assistant_autosave_key` / `should_skip_autosave_content` not deleted from `zeroclaw-memory/lib.rs`**: These functions are still used by `zeroclaw-gateway` and `zeroclaw-channels`. They remain as legacy helpers; Phase 7 cleanup will remove them when the full auto-save code is excised from those crates.
+
 ---
 
 ### Phase 2: Summary DAG Compressor

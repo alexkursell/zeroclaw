@@ -18,6 +18,16 @@ use zeroclaw_config::schema::SearchMode;
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// A row from the immutable `messages` table.
+pub struct MessageEntry {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+    pub summary_id: Option<String>, // populated in Phase 2; always None for now
+}
+
 /// SQLite-backed persistent memory — the brain
 ///
 /// Full-stack search engine:
@@ -62,7 +72,8 @@ impl SqliteMemory {
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
              PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
+             PRAGMA temp_store   = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )?;
         Self::init_schema(&conn)?;
         Ok(Self {
@@ -104,12 +115,14 @@ impl SqliteMemory {
         // mmap 8 MB: let the OS page-cache serve hot reads
         // cache 2 MB: keep ~500 hot pages in-process
         // temp_store memory: temp tables never hit disk
+        // foreign_keys: enforce FK constraints (messages → summaries in Phase 2+)
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
              PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
+             PRAGMA temp_store   = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )?;
 
         Self::init_schema(&conn)?;
@@ -200,7 +213,26 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Immutable session history (Phase 1)
+            CREATE TABLE IF NOT EXISTS messages (
+                id           TEXT PRIMARY KEY,
+                session_id   TEXT NOT NULL,
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                token_count  INTEGER,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content, content=messages, content_rowid=rowid
+            );
+            CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -274,6 +306,91 @@ impl SqliteMemory {
     /// Provide access to the connection for advanced queries (e.g. retrieval pipeline).
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
+    }
+
+    /// Append a single message to the immutable store (synchronous).
+    /// Called immediately after each history.push() in the agent loop.
+    /// INSERT OR IGNORE makes this idempotent — duplicate IDs are silently skipped.
+    pub fn append_message(
+        &self,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        token_count: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let created_at = chrono::Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO messages (id, session_id, role, content, token_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, session_id, role, content, token_count, created_at],
+        )?;
+        Ok(())
+    }
+
+
+    /// Full-text search over verbatim message content. Used by lcm_grep (Phase 5).
+    pub fn search_messages(
+        &self,
+        pattern: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEntry>> {
+        // Escape FTS5 special chars and build query
+        let fts_query: String = pattern
+            .split_whitespace()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| {
+            Ok(MessageEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                summary_id: None,
+            })
+        };
+
+        let results = if let Some(sid) = session_id {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.session_id, m.role, m.content, m.created_at
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 WHERE messages_fts MATCH ?1
+                   AND m.session_id = ?2
+                 ORDER BY m.created_at DESC
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![fts_query, sid, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.session_id, m.role, m.content, m.created_at
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY m.created_at DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![fts_query, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        };
+
+        Ok(results)
     }
 
     /// Get embedding from cache, or compute + cache it
@@ -1085,6 +1202,24 @@ impl Memory for SqliteMemory {
             .take(limit)
             .collect();
         Ok(filtered)
+    }
+
+    async fn append_message(
+        &self,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        token_count: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let created_at = chrono::Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO messages (id, session_id, role, content, token_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, session_id, role, content, token_count, created_at],
+        )?;
+        Ok(())
     }
 
     async fn store_with_metadata(
@@ -2760,5 +2895,135 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1 — Immutable Message Store tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn messages_append_and_retrieve() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let id = "test-id-001";
+        mem.append_message(id, "session-1", "user", "Hello world", None)
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let found: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "Hello world");
+    }
+
+    #[test]
+    fn messages_fts_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.append_message(
+            "fts-test-id",
+            "session-1",
+            "user",
+            "The quick brown fox jumped",
+            None,
+        )
+        .unwrap();
+
+        let results = mem.search_messages("quick", None, 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "FTS search should find the inserted message"
+        );
+        assert_eq!(results[0].id, "fts-test-id");
+        assert!(results[0].content.contains("quick"));
+    }
+
+    #[test]
+    fn messages_are_immutable() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let id = "immutable-id";
+        mem.append_message(id, "session-1", "user", "Original content", None)
+            .unwrap();
+        // Second call with same id must be a no-op (INSERT OR IGNORE)
+        mem.append_message(id, "session-1", "user", "Changed content", None)
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "Duplicate id must not create a second row");
+
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Original content", "Original content must be preserved");
+    }
+
+    #[test]
+    fn messages_session_filter() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.append_message("id-a1", "session-a", "user", "alpha message about rust", None)
+            .unwrap();
+        mem.append_message("id-b1", "session-b", "user", "beta message about rust", None)
+            .unwrap();
+
+        let results_a = mem
+            .search_messages("rust", Some("session-a"), 10)
+            .unwrap();
+        assert_eq!(results_a.len(), 1);
+        assert_eq!(results_a[0].id, "id-a1");
+
+        let results_b = mem
+            .search_messages("rust", Some("session-b"), 10)
+            .unwrap();
+        assert_eq!(results_b.len(), 1);
+        assert_eq!(results_b[0].id, "id-b1");
+
+        let results_all = mem.search_messages("rust", None, 10).unwrap();
+        assert_eq!(results_all.len(), 2);
+    }
+
+    #[test]
+    fn messages_role_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.append_message("r-user", "s1", "user", "user content", None)
+            .unwrap();
+        mem.append_message("r-assistant", "s1", "assistant", "assistant content", None)
+            .unwrap();
+        mem.append_message("r-tool", "s1", "tool", "tool content", None)
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let role_of = |id: &str| -> String {
+            conn.query_row(
+                "SELECT role FROM messages WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(role_of("r-user"), "user");
+        assert_eq!(role_of("r-assistant"), "assistant");
+        assert_eq!(role_of("r-tool"), "tool");
     }
 }

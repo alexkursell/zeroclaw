@@ -77,10 +77,6 @@ pub use super::history::{
     truncate_tool_result,
 };
 
-/// Minimum user-message length (in chars) for auto-save to memory.
-/// Matches the channel-side constant in `channels/mod.rs`.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -315,10 +311,6 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
         .collect()
 }
 
-fn autosave_memory_key(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4())
-}
-
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
@@ -347,12 +339,6 @@ async fn build_context(
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
-                if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
-                }
-                if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
-                    continue;
-                }
                 // Skip entries containing tool_result blocks — they can leak
                 // stale tool output from previous heartbeat ticks into new
                 // sessions, presenting the LLM with orphan tool_result data.
@@ -2428,22 +2414,6 @@ pub async fn run(
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
 
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save
-            && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
-        {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(
-                    &user_key,
-                    &effective_msg,
-                    MemoryCategory::Conversation,
-                    memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
         // Inject memory + hardware RAG context into user message
         let mem_context = build_context(
             mem.as_ref(),
@@ -2469,6 +2439,16 @@ pub async fn run(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        // Persist user message to immutable store immediately (crash-safe)
+        let _ = mem
+            .append_message(
+                &history[1].id,
+                memory_session_id.as_deref().unwrap_or("cli"),
+                "user",
+                &enriched,
+                None,
+            )
+            .await;
 
         // Prune history for token efficiency (when enabled).
         if config.agent.history_pruning.enabled {
@@ -2712,22 +2692,6 @@ pub async fn run(
                 }
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save
-                && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-            {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(
-                        &user_key,
-                        &effective_input,
-                        MemoryCategory::Conversation,
-                        memory_session_id.as_deref(),
-                    )
-                    .await;
-            }
-
             // Inject memory + hardware RAG context into user message
             let mem_context = build_context(
                 mem.as_ref(),
@@ -2750,6 +2714,16 @@ pub async fn run(
             };
 
             history.push(ChatMessage::user(&enriched));
+            // Persist user message to immutable store immediately (crash-safe)
+            let _ = mem
+                .append_message(
+                    &history.last().unwrap().id,
+                    memory_session_id.as_deref().unwrap_or("cli"),
+                    "user",
+                    &enriched,
+                    None,
+                )
+                .await;
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
@@ -3308,6 +3282,16 @@ pub async fn process_message(
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    // Persist user message to immutable store immediately (crash-safe)
+    let _ = mem
+        .append_message(
+            &history[1].id,
+            session_id.unwrap_or("daemon"),
+            "user",
+            &enriched,
+            None,
+        )
+        .await;
     let mut excluded_tools = compute_excluded_mcp_tools(
         &tools_registry,
         &config.agent.tool_filter_groups,
@@ -6015,64 +5999,6 @@ mod tests {
         ];
         trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history.len(), 3);
-    }
-
-    #[test]
-    fn autosave_memory_key_has_prefix_and_uniqueness() {
-        let key1 = autosave_memory_key("user_msg");
-        let key2 = autosave_memory_key("user_msg");
-
-        assert!(key1.starts_with("user_msg_"));
-        assert!(key2.starts_with("user_msg_"));
-        assert_ne!(key1, key2);
-    }
-
-    #[tokio::test]
-    async fn autosave_memory_keys_preserve_multiple_turns() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
-
-        let key1 = autosave_memory_key("user_msg");
-        let key2 = autosave_memory_key("user_msg");
-
-        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-        mem.store(&key2, "I'm 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        assert_eq!(mem.count().await.unwrap(), 2);
-
-        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
-        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
-    }
-
-    #[tokio::test]
-    async fn build_context_ignores_legacy_assistant_autosave_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store(
-            "assistant_resp_poisoned",
-            "User suffered a fabricated event",
-            MemoryCategory::Daily,
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "user_msg_real",
-            "User asked for concise status updates",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_context(&mem, "status updates", 0.0, None).await;
-        assert!(context.contains("user_msg_real"));
-        assert!(!context.contains("assistant_resp_poisoned"));
-        assert!(!context.contains("fabricated event"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -180,6 +180,22 @@ pub trait Memory: Send + Sync {
         Ok(())
     }
 
+    /// Append a single message to the immutable message store.
+    ///
+    /// Called after each `history.push()` in the agent loop. Backends that
+    /// support immutable message storage override this; the default is a no-op
+    /// so non-SQLite backends continue to work without changes.
+    async fn append_message(
+        &self,
+        _id: &str,
+        _session_id: &str,
+        _role: &str,
+        _content: &str,
+        _token_count: Option<i64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Recall memories scoped to a specific namespace.
     ///
     /// Default implementation delegates to `recall()` and filters by namespace.
