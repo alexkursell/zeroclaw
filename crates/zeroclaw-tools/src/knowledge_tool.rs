@@ -1,13 +1,14 @@
 //! Knowledge management tool for capturing, searching, and reusing expertise.
 //!
 //! Exposes the knowledge graph to the agent via the `Tool` trait with actions:
-//! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
+//! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats,
+//! entity_store, entity_get, entity_list.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
-use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, NodeType, Relation};
+use zeroclaw_memory::knowledge_graph::{normalize_type, KnowledgeGraph};
 
 /// Tool for managing a knowledge graph of patterns, decisions, lessons, and experts.
 pub struct KnowledgeTool {
@@ -27,7 +28,7 @@ impl Tool for KnowledgeTool {
     }
 
     fn description(&self) -> &str {
-        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
+        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats, entity_store, entity_get, entity_list."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -36,13 +37,12 @@ impl Tool for KnowledgeTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["capture", "search", "relate", "suggest", "expert_find", "lessons_extract", "graph_stats"],
+                    "enum": ["capture", "search", "relate", "suggest", "expert_find", "lessons_extract", "graph_stats", "entity_store", "entity_get", "entity_list"],
                     "description": "The action to perform"
                 },
                 "node_type": {
                     "type": "string",
-                    "enum": ["pattern", "decision", "lesson", "expert", "technology"],
-                    "description": "Type of knowledge node (for capture)"
+                    "description": "Type of knowledge node, free-form lowercase string (e.g. pattern, decision, lesson, expert, technology, person, project)"
                 },
                 "title": {
                     "type": "string",
@@ -50,7 +50,7 @@ impl Tool for KnowledgeTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content body (for capture) or text to extract lessons from (for lessons_extract)"
+                    "description": "Content body (for capture/entity_store) or text to extract lessons from (for lessons_extract)"
                 },
                 "tags": {
                     "type": "array",
@@ -75,8 +75,11 @@ impl Tool for KnowledgeTool {
                 },
                 "relation": {
                     "type": "string",
-                    "enum": ["uses", "replaces", "extends", "authored_by", "applies_to"],
-                    "description": "Relationship type (for relate)"
+                    "description": "Relationship type, free-form lowercase string (e.g. uses, replaces, extends, authored_by, applies_to)"
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Entity slug identifier (for entity_store, entity_get)"
                 },
                 "filters": {
                     "type": "object",
@@ -106,6 +109,9 @@ impl Tool for KnowledgeTool {
             "expert_find" => self.handle_expert_find(&args),
             "lessons_extract" => self.handle_lessons_extract(&args),
             "graph_stats" => self.handle_graph_stats(),
+            "entity_store" => self.handle_entity_store(&args),
+            "entity_get" => self.handle_entity_get(&args),
+            "entity_list" => self.handle_entity_list(&args),
             other => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -130,7 +136,7 @@ impl KnowledgeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'content' for capture"))?;
 
-        let node_type = NodeType::parse(node_type_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let node_type = normalize_type(node_type_str);
 
         let tags: Vec<String> = args
             .get("tags")
@@ -146,7 +152,7 @@ impl KnowledgeTool {
 
         match self
             .graph
-            .add_node(node_type, title, content, &tags, source_project)
+            .add_node(&node_type, title, content, &tags, source_project)
         {
             Ok(id) => Ok(ToolResult {
                 success: true,
@@ -186,13 +192,13 @@ impl KnowledgeTool {
             .and_then(|f| f.get("project"))
             .and_then(|v| v.as_str());
 
-        // Parse the node_type filter once so it applies in all code paths.
-        let parsed_filter_type = filter_type.and_then(|ft| NodeType::parse(ft).ok());
+        // Normalize the type filter for consistent comparison.
+        let normalized_filter_type = filter_type.map(normalize_type);
 
         let results = if query.is_empty() && !filter_tags.is_empty() {
             // Tag-only search -- apply node_type and project filters consistently.
             let mut nodes = self.graph.query_by_tags(&filter_tags)?;
-            if let Some(ref nt) = parsed_filter_type {
+            if let Some(ref nt) = normalized_filter_type {
                 nodes.retain(|n| &n.node_type == nt);
             }
             if let Some(proj) = filter_project {
@@ -206,7 +212,7 @@ impl KnowledgeTool {
             let mut search_results = self.graph.query_by_similarity(query, 20)?;
 
             // Post-filter by type if specified.
-            if let Some(ref nt) = parsed_filter_type {
+            if let Some(ref nt) = normalized_filter_type {
                 search_results.retain(|r| &r.node.node_type == nt);
             }
             // Post-filter by project if specified.
@@ -254,9 +260,7 @@ impl KnowledgeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'relation' for relate"))?;
 
-        let relation = Relation::parse(relation_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        match self.graph.add_edge(from_id, to_id, relation) {
+        match self.graph.add_edge(from_id, to_id, relation_str) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: "relationship created".to_string(),
@@ -394,6 +398,135 @@ impl KnowledgeTool {
             output: json!({ "lessons": lessons, "count": lessons.len() }).to_string(),
             error: None,
         })
+    }
+
+    fn handle_entity_store(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let node_type_str = args
+            .get("node_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'node_type' for entity_store"))?;
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'slug' for entity_store"))?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'content' for entity_store"))?;
+
+        let node_type = normalize_type(node_type_str);
+
+        match self
+            .graph
+            .find_or_create_by_slug(slug, &node_type, slug, "")
+        {
+            Ok((node_id, _created)) => {
+                if let Err(e) = self.graph.add_event(&node_id, content, None, None) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("entity_store add_event failed: {e}")),
+                    });
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({ "node_id": node_id, "slug": slug }).to_string(),
+                    error: None,
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("entity_store failed: {e}")),
+            }),
+        }
+    }
+
+    fn handle_entity_get(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'slug' for entity_get"))?;
+
+        let node_type = args
+            .get("node_type")
+            .and_then(|v| v.as_str())
+            .map(normalize_type);
+        let normalized = zeroclaw_memory::knowledge_graph::normalize_slug(slug);
+
+        // find_or_create_by_slug returns the existing ID when the slug matches.
+        // We use a placeholder type when none is provided — the type is only written on INSERT.
+        let lookup_type = node_type.as_deref().unwrap_or("entity");
+        match self
+            .graph
+            .find_or_create_by_slug(slug, lookup_type, slug, "")
+        {
+            Ok((node_id, _created)) => {
+                match self.graph.get_with_timeline(&node_id, 20) {
+                    Ok(Some((node, events))) => {
+                        let events_json: Vec<serde_json::Value> = events
+                            .iter()
+                            .map(|e| json!({ "content": e.content, "recorded_at": e.created_at }))
+                            .collect();
+                        Ok(ToolResult {
+                            success: true,
+                            output: json!({
+                                "node_id": node.id,
+                                "slug": normalized,
+                                "node_type": node.node_type,
+                                "title": node.title,
+                                "synthesis": node.synthesis,
+                                "synthesis_at": node.synthesis_at,
+                                "events": events_json,
+                            })
+                            .to_string(),
+                            error: None,
+                        })
+                    }
+                    Ok(None) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("entity not found: {slug}")),
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("entity_get failed: {e}")),
+                    }),
+                }
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("entity_get lookup failed: {e}")),
+            }),
+        }
+    }
+
+    fn handle_entity_list(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+
+        match self.graph.list_entity_slugs(limit) {
+            Ok(slugs) => {
+                let items: Vec<serde_json::Value> = slugs
+                    .into_iter()
+                    .map(|(slug, node_type)| json!({ "slug": slug, "node_type": node_type }))
+                    .collect();
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({ "entities": items, "count": items.len() }).to_string(),
+                    error: None,
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("entity_list failed: {e}")),
+            }),
+        }
     }
 
     fn handle_graph_stats(&self) -> anyhow::Result<ToolResult> {

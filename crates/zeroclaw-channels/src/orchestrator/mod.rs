@@ -3302,6 +3302,7 @@ async fn process_channel_message(
                         provider.as_ref(),
                         &model,
                         memory.as_ref(),
+                        None,
                         &user_msg,
                         &assistant_resp,
                     )

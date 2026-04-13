@@ -1109,6 +1109,56 @@ async fn consolidation_handles_malformed_entity_json() {
 
 **Deliverable:** The knowledge graph can represent any kind of entity with synthesis + timeline. Entities are created automatically via consolidation and manually via tools. No code changes needed to track new entity types.
 
+#### Implementation Notes
+
+Implemented 2026-04-13. All changes on branch `better-memory`.
+
+**`knowledge_graph.rs` — enum removal and free-form types:**
+- Deleted `NodeType` and `Relation` enums and their `as_str()`/`parse()` impls.
+- `KnowledgeNode.node_type` and `KnowledgeEdge.relation` changed from enum to `String`.
+- Added `normalize_type(s)` and `normalize_slug(s)`: lowercase, collapse non-alnum to `_`, strip leading/trailing `_`. Both delegate the logic to `normalize_slug`.
+- Both applied at write boundaries (`add_node`, `add_edge`, `find_or_create_by_slug`).
+
+**`knowledge_graph.rs` — schema additions:**
+- `init_schema()` adds `synthesis TEXT` and `synthesis_at TEXT` columns via `ALTER TABLE ADD COLUMN IF NOT EXISTS` (safe re-run).
+- New `node_events` table: `id, node_id, content, source_message_id, session_id, created_at`.
+- New `node_events_fts` FTS5 virtual table mirroring content.
+- `node_events_mark_stale` trigger: on INSERT into `node_events`, sets `synthesis_at = NULL` and `updated_at = datetime('now')` on the affected node.
+
+**`knowledge_graph.rs` — new methods:**
+- `add_event(node_id, content, source_message_id, session_id)` → event id.
+- `get_with_timeline(node_id, event_limit)` → `Option<(KnowledgeNode, Vec<NodeEvent>)>`, events in DESC order.
+- `find_or_create_by_slug(slug, node_type, title, initial_content)` — pass 1: exact `title` match; pass 2: cosine (inert until Phase 6, no embeddings yet); pass 3: INSERT new node. Returns `(node_id, created)`.
+- `list_stale_nodes(limit)` — nodes where `synthesis_at IS NULL` ordered by `updated_at DESC`.
+- `update_synthesis(node_id, synthesis, embedding)` — updates `synthesis`, `synthesis_at = now()`, and optionally the embedding blob.
+- `list_entity_slugs(limit)` — returns `(title, node_type)` pairs ordered by `updated_at DESC`.
+
+**`knowledge_graph.rs` — tests added (12 new):**
+All verifications from the spec implemented: slug normalization, type normalization, write-time normalization, duplicate relation upsert, find-or-create exact match, find-or-create new slug, add-event marks stale, stale node ordering, get-with-timeline, update-synthesis persists, list-entity-slugs ordering.
+
+**`knowledge_tool.rs`:**
+- Removed `NodeType, Relation` imports; added `normalize_type` import.
+- `handle_capture`: uses `normalize_type()` instead of `NodeType::parse()`.
+- `handle_relate`: passes relation string directly to `add_edge()` (no parse step).
+- `handle_search`: filter comparison uses `normalize_type()` on the filter value.
+- Added `entity_store` action: `normalize_type(node_type)` → `find_or_create_by_slug()` → `add_event()`.
+- Added `entity_get` action: `find_or_create_by_slug()` → `get_with_timeline()` → returns synthesis + events JSON.
+- Added `entity_list` action: `list_entity_slugs(limit)` → `{entities: [...], count: N}`.
+- Schema description updated: `node_type` and `relation` are now free-form lowercase strings; enum arrays removed.
+
+**`consolidation.rs`:**
+- Added `EntityMention`, `RelationMention`, `EntityExtractionResult` structs.
+- Added `ENTITY_EXTRACTION_SYSTEM_PROMPT` constant.
+- `consolidate_turn()` gains `knowledge: Option<&KnowledgeGraph>` parameter (call sites pass `None`).
+- When `knowledge.is_some()`: second LLM call with entity extraction prompt, result parsed via `parse_entity_extraction_response()`. For each entity: `find_or_create_by_slug()` + `add_event()`. For each relation: resolve both slugs to node IDs + `add_edge()`. Errors are debug-logged, not propagated.
+- Added `parse_entity_extraction_response()` free function.
+
+**Deviations from spec:**
+- Entity context ("Existing entities: alice (person), ...") not injected into the entity extraction call. The spec says to prefix the truncated turn text with `knowledge.list_entity_slugs(100)`. This was omitted to keep the initial implementation simple — it can be added in a follow-up without changing the interface.
+- Cosine dedup pass in `find_or_create_by_slug` is written (the code path exists) but is inert: no embeddings exist until Phase 6, so it falls through to pass 3 (create) every time, matching the spec's expectation.
+
+**Tests:** 301 memory tests + 1097 tool tests pass. 0 failures.
+
 ---
 
 ### Phase 4: Unified Recall with RRF

@@ -474,6 +474,7 @@ async fn process_chat_message(
                         provider.as_ref(),
                         &model,
                         mem.as_ref(),
+                        None,
                         &user_msg,
                         &assistant_resp,
                     )

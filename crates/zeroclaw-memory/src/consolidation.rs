@@ -4,14 +4,63 @@
 //! - `history_entry`: A timestamped summary for the daily conversation log.
 //! - `memory_update`: New facts, preferences, or decisions worth remembering
 //!   long-term (or `null` if nothing new was learned).
+//! - Entity/relation extraction for the knowledge graph (Phase 3).
 //!
 //! This two-phase approach replaces the naive raw-message auto-save with
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
 use crate::conflict;
 use crate::importance;
+use crate::knowledge_graph::KnowledgeGraph;
 use crate::traits::{Memory, MemoryCategory};
 use zeroclaw_api::provider::Provider;
+
+/// A single entity mention extracted from a conversation turn.
+#[derive(Debug, serde::Deserialize)]
+pub struct EntityMention {
+    /// Free-form entity type (e.g. "person", "project", "technology").
+    pub entity_type: String,
+    /// Normalized slug identifier (e.g. "alice_smith", "zeroclaw").
+    pub slug: String,
+    /// Short fact about the entity observed in this turn.
+    pub fact: String,
+}
+
+/// A directed relation between two entities.
+#[derive(Debug, serde::Deserialize)]
+pub struct RelationMention {
+    pub from_slug: String,
+    pub relation: String,
+    pub to_slug: String,
+}
+
+/// Result of the entity extraction LLM call.
+#[derive(Debug, serde::Deserialize)]
+pub struct EntityExtractionResult {
+    #[serde(default)]
+    pub entities: Vec<EntityMention>,
+    #[serde(default)]
+    pub relations: Vec<RelationMention>,
+}
+
+const ENTITY_EXTRACTION_SYSTEM_PROMPT: &str = r#"You are an entity extraction engine. Given a conversation turn, identify named entities (people, projects, technologies, organizations, concepts) and factual relationships between them.
+
+Return ONLY valid JSON:
+{
+  "entities": [
+    {"entity_type": "person|project|technology|...", "slug": "snake_case_identifier", "fact": "short fact observed"}
+  ],
+  "relations": [
+    {"from_slug": "slug_a", "relation": "uses|extends|depends_on|...", "to_slug": "slug_b"}
+  ]
+}
+
+Rules:
+- slug must be lowercase snake_case, no spaces
+- entity_type must be lowercase
+- Only extract entities clearly mentioned; return empty arrays if nothing notable
+- Keep facts to one sentence
+- Do not include any text outside the JSON"#;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -56,6 +105,7 @@ pub async fn consolidate_turn(
     provider: &dyn Provider,
     model: &str,
     memory: &dyn Memory,
+    knowledge: Option<&KnowledgeGraph>,
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
@@ -132,7 +182,62 @@ pub async fn consolidate_turn(
             .await?;
     }
 
+    // Phase 3: Entity extraction into knowledge graph (optional).
+    if let Some(kg) = knowledge {
+        if let Ok(raw_entities) = provider
+            .chat_with_system(Some(ENTITY_EXTRACTION_SYSTEM_PROMPT), &truncated, model, 0.0)
+            .await
+        {
+            if let Ok(extracted) = parse_entity_extraction_response(&raw_entities) {
+                for entity in &extracted.entities {
+                    match kg.find_or_create_by_slug(
+                        &entity.slug,
+                        &entity.entity_type,
+                        &entity.slug,
+                        "",
+                    ) {
+                        Ok((node_id, _)) => {
+                            if let Err(e) = kg.add_event(&node_id, &entity.fact, None, None) {
+                                tracing::debug!("entity event write failed: {e}");
+                            }
+                        }
+                        Err(e) => tracing::debug!("entity upsert failed: {e}"),
+                    }
+                }
+
+                for rel in &extracted.relations {
+                    // Resolve slugs to node IDs using find_or_create (non-destructive).
+                    let from_id = kg
+                        .find_or_create_by_slug(&rel.from_slug, "entity", &rel.from_slug, "")
+                        .map(|(id, _)| id);
+                    let to_id = kg
+                        .find_or_create_by_slug(&rel.to_slug, "entity", &rel.to_slug, "")
+                        .map(|(id, _)| id);
+                    match (from_id, to_id) {
+                        (Ok(from), Ok(to)) => {
+                            if let Err(e) = kg.add_edge(&from, &to, &rel.relation) {
+                                tracing::debug!("relation write failed: {e}");
+                            }
+                        }
+                        _ => tracing::debug!("could not resolve relation slugs"),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Parse entity extraction response, returning an error if JSON is invalid.
+fn parse_entity_extraction_response(raw: &str) -> anyhow::Result<EntityExtractionResult> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    Ok(serde_json::from_str(cleaned)?)
 }
 
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
