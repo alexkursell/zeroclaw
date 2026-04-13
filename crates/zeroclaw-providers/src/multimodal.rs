@@ -166,6 +166,7 @@ pub async fn prepare_messages_for_provider(
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
+            ..Default::default()
         });
     }
 
@@ -217,6 +218,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                 ChatMessage {
                     role: m.role.clone(),
                     content: text,
+                    ..Default::default()
                 }
             } else {
                 m.clone()

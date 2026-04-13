@@ -5,9 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+fn new_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+impl Default for ChatMessage {
+    fn default() -> Self {
+        Self {
+            id: new_message_id(),
+            role: String::new(),
+            content: String::new(),
+        }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default = "new_message_id")]
+    pub id: String,
     pub role: String,
     pub content: String,
 }
@@ -15,6 +31,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role: "system".into(),
             content: content.into(),
         }
@@ -22,6 +39,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role: "user".into(),
             content: content.into(),
         }
@@ -29,6 +47,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role: "assistant".into(),
             content: content.into(),
         }
@@ -36,6 +55,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role: "tool".into(),
             content: content.into(),
         }
@@ -622,4 +642,34 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     }
 
     instructions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_constructor_generates_unique_ids() {
+        let a = ChatMessage::user("hello");
+        let b = ChatMessage::user("hello");
+        assert_ne!(a.id, b.id, "same content must produce different IDs");
+    }
+
+    #[test]
+    fn chat_message_id_survives_round_trip() {
+        let msg = ChatMessage::assistant("response");
+        let json = serde_json::to_string(&msg).unwrap();
+        let restored: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.id, restored.id);
+    }
+
+    #[test]
+    fn chat_message_deserializes_without_id_field() {
+        // Simulates loading a legacy session JSONL entry that has no id field.
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert!(!msg.id.is_empty(), "missing id field should get a fresh UUID");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "hello");
+    }
 }

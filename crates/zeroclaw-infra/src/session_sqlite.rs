@@ -174,6 +174,7 @@ impl SessionBackend for SqliteSessionBackend {
 
         let rows = match stmt.query_map(params![session_key], |row| {
             Ok(ChatMessage {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: row.get(0)?,
                 content: row.get(1)?,
             })

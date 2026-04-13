@@ -1,6 +1,6 @@
 # Unified Memory Architecture — Revised Design
 
-**Status:** Proposal v2 — revised after code review  
+**Status:** Proposal v3 — critiques applied, implementation guide with integration tests  
 **Date:** 2026-04-12  
 **Scope:** Evolve ZeroClaw's existing memory subsystem toward lossless history, structured entity knowledge, and better retrieval
 
@@ -16,6 +16,7 @@
 6. [Implementation Plan](#6-implementation-plan)
 7. [What Gets Cut](#7-what-gets-cut)
 8. [Open Questions](#8-open-questions)
+9. [Integration Test Suite](#9-integration-test-suite)
 
 ---
 
@@ -35,12 +36,12 @@ Plus the in-memory `history: Vec<ChatMessage>` which is the actual working set s
 
 ### 1.2 Memory Store (brain.db)
 
-The `Memory` trait (`memory_traits.rs`) with 5 backends. The SQLite backend is the recommended default:
+The `Memory` trait (`zeroclaw-api/src/memory_traits.rs`) with 5 backends. The SQLite backend is the recommended default:
 
 - **Schema:** `memories` table with id, key, content, category, embedding, timestamps, session_id, namespace, importance, superseded_by
 - **Search:** Multi-stage pipeline (cache → FTS5 BM25 → cosine similarity → LIKE fallback) with hybrid merge using weighted linear combination (0.7 vector + 0.3 keyword)
 - **Categories:** Core (evergreen, no decay), Daily (7-day half-life), Conversation (7-day half-life), Custom
-- **Auto-save:** Every user message ≥20 chars stored as Conversation category (removed by this proposal — replaced by the `messages` table)
+- **Auto-save:** Every user message ≥20 chars stored as Conversation category
 - **Consolidation:** Per-turn LLM extraction (`consolidation.rs`) writes Daily history entries and Core facts, with semantic conflict resolution (0.85 cosine threshold)
 - **Conflict resolution:** Detects semantic duplicates, marks old entries `superseded_by` (logical delete)
 - **Decay:** Exponential time decay applied at recall time, Core entries exempt
@@ -49,14 +50,15 @@ The `Memory` trait (`memory_traits.rs`) with 5 backends. The SQLite backend is t
 
 ### 1.3 Knowledge Graph (knowledge.db)
 
-Separate SQLite database (`knowledge_graph.rs`, ~600 lines):
+Separate SQLite database (`knowledge_graph.rs`, ~863 lines):
 
-- **Node types:** Pattern, Decision, Lesson, Expert, Technology
-- **Relations:** Uses, Replaces, Extends, AuthoredBy, AppliesTo
+- **Node types:** Pattern, Decision, Lesson, Expert, Technology — hardcoded Rust enum
+- **Relations:** Uses, Replaces, Extends, AuthoredBy, AppliesTo — hardcoded Rust enum
 - **Search:** FTS5 on title/content/tags
 - **Traversal:** Recursive CTE for multi-hop graph queries
 - **Tool:** `knowledge` tool with actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats
 - **Cap:** max_nodes limit enforced at insert time
+- **FK enforcement:** `PRAGMA foreign_keys = ON` is set (unlike brain.db)
 
 ### 1.4 Session Persistence
 
@@ -66,13 +68,12 @@ Two mechanisms:
 
 ### 1.5 Context Compressor
 
-Multi-pass compression (`context_compressor.rs`, 764 lines):
+Multi-pass compression (`context_compressor.rs`, 763 lines):
 
 - Triggered at 50% context window usage
 - Protects first 3 + last 4 messages
-- Pass 1: Trim tool results in non-protected messages
-- Pass 2-4: LLM summarization of middle section (up to 3 passes)
-- Fallback: Raw truncation if LLM fails/times out
+- Pass 1–N: LLM summarization of middle section (up to `max_passes` passes)
+- Fallback: Raw truncation on LLM timeout/failure
 - Summary persisted to `memories` table as Daily category before originals discarded from the Vec
 - Tool pair repair: cleans up orphaned tool_call/tool_result pairs
 
@@ -88,6 +89,10 @@ Multi-pass compression (`context_compressor.rs`, 764 lines):
 6. Prepend to user message
 
 At most 5 entries. Flat list, no structure. Knowledge graph is not queried.
+
+### 1.7 Retrieval Pipeline
+
+`retrieval.rs` wraps `Arc<dyn Memory>` with a 5-minute in-memory LRU cache and configurable stage dispatch ("cache" → "fts" → "vector"). `build_context()` uses this pipeline. Currently only knows about the `Memory` trait — unaware of the knowledge graph.
 
 ---
 
@@ -119,7 +124,7 @@ The knowledge graph lives in a separate SQLite file, is not queried during `buil
 - Session history from other sessions
 - Compressed summaries from earlier in the current session
 
-The agent can manually call `memory_recall` and `knowledge` tools, but the automatic context injection — the thing that makes every response contextually aware — is blind to two of the three storage systems.
+The agent can manually call `memory_recall` and `knowledge` tools, but the automatic context injection is blind to two of the three storage systems.
 
 ### 2.4 Weighted Linear Merge is Fragile (Medium)
 
@@ -140,7 +145,7 @@ The `[Memory context]` injection is a flat list of `key: content` pairs. When en
 | Immutable message store | Make the `messages` table in brain.db the single source of truth for all session history. Never delete, never modify. |
 | Summary DAG with parent pointers | Track which messages each summary covers, and which summaries have been further condensed. Provenance chain from any summary back to originals. |
 | Three-level escalation | Formalize the compressor's existing multi-pass + fallback into guaranteed convergence: (1) preserve_details, (2) bullet_points at half target, (3) deterministic truncation. |
-| Soft/hard thresholds | Async compaction below hard threshold, blocking above. Already partially there with the trigger ratio. |
+| Soft/hard thresholds | Between-turns compaction below hard threshold, pre-LLM-call compaction above. |
 | `lcm_grep` | Regex search over verbatim history. Qualitatively different from scored recall — for forensic "what did I say about X on Tuesday" queries. |
 
 ### From GBrain
@@ -168,7 +173,7 @@ The `[Memory context]` injection is a flat list of `key: content` pairs. When en
 
 1. **Evolve, don't duplicate.** Every new capability must extend an existing system, not create a parallel one.
 
-2. **Two SQLite files, separate concerns.** `brain.db` owns flat facts and session history. `knowledge.db` owns the entity graph. They stay separate — different write patterns (bulk synthesis writes during dream cycle vs. frequent small writes during conversation), separate WAL contention, and no real need for cross-database foreign keys. RRF recall queries both in parallel via `tokio::join!` and merges in Rust. The `node_events.source_message_id` link to `messages` is a soft reference (UUID string lookup), not a hard FK constraint — temporal correlation (matching timestamps) works as fallback.
+2. **Two SQLite files, separate concerns.** `brain.db` owns flat facts and session history. `knowledge.db` owns the entity graph. They stay separate — different write patterns, separate WAL contention, no real need for cross-database foreign keys. RRF recall queries both in parallel via `tokio::join!`. The `node_events.source_message_id` link to `messages` is a soft reference (UUID string lookup, not a FK constraint) — temporal correlation works as fallback.
 
 3. **Immutable source of truth.** Raw messages are never modified or deleted. Summaries, entities, and facts are derived caches that can always be regenerated.
 
@@ -176,7 +181,7 @@ The `[Memory context]` injection is a flat list of `key: content` pairs. When en
 
 5. **Deterministic convergence.** The compressor must always terminate. Three escalation levels, the last one requires no LLM.
 
-6. **Backward compatible.** Existing `brain.db` files gain new tables via `CREATE TABLE IF NOT EXISTS`. Existing `memories` data untouched. `knowledge.db` gains new columns and tables additively. Old config works, new config unlocks new features.
+6. **No backwards-compatibility shims.** This is a new deployment. Old data paths (auto-save Conversation entries, compressor Daily entries to `memories`) are removed cleanly, not kept alive behind flags.
 
 ---
 
@@ -194,7 +199,9 @@ brain.db (existing, extended)
 ├── messages           (NEW — immutable session history)
 ├── messages_fts       (NEW — FTS5 over raw history for lcm_grep)
 │
-└── summaries          (NEW — DAG of compressed summary nodes)
+├── summaries          (NEW — DAG of compressed summary nodes)
+├── summaries_fts      (NEW — FTS5 for recall over summary content)
+└── summary_parents    (NEW — junction table for multi-parent condensed summaries)
 
 
 knowledge.db (existing, extended)
@@ -208,37 +215,36 @@ knowledge.db (existing, extended)
 ```
 
 **What changed:**
-- `messages` + `summaries` tables added to brain.db for lossless session history
+- `messages` + `summaries` + `summary_parents` tables added to brain.db for lossless session history
 - `node_events` table added to knowledge.db for entity timelines
 - `nodes` table gains optional `synthesis`, `synthesis_at`, `embedding` columns
-- Node types and relation types become free-form strings instead of hardcoded enums — the LLM can create any type it needs (person, company, restaurant, book, etc.) without code changes
+- Node types and relation types become free-form lowercase strings — the LLM can create any type it needs without code changes
+- `PRAGMA foreign_keys = ON` added to brain.db (currently missing; knowledge.db already has it)
 
 **What didn't change:**
-- `memories` table structure and data — untouched
-- `knowledge.db` stays as its own file — no migration needed
+- `memories` table structure and data
+- `knowledge.db` stays as its own file
 - `Memory` trait interface — all backends still valid
-- Auto-save, consolidation, hygiene — continue working
+- Consolidation still runs; its output schema is extended
 
 ### 5.2 Schema Additions
 
 ```sql
 -- ─────────────────────────────────────────────
--- Immutable session history
+-- brain.db additions
 -- ─────────────────────────────────────────────
 
+-- Immutable session history
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
     session_id   TEXT NOT NULL,
     role         TEXT NOT NULL,              -- user | assistant | system | tool
     content      TEXT NOT NULL,              -- verbatim, never modified
     token_count  INTEGER,
-    created_at   TEXT NOT NULL,              -- RFC 3339
-    summary_id   TEXT REFERENCES summaries(id)
-                     DEFERRABLE INITIALLY DEFERRED
-                                            -- NULL = active; non-NULL = covered by this summary
+    created_at   TEXT NOT NULL               -- RFC 3339
+    -- Note: no summary_id FK here; see summary_parents below
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_messages_summary ON messages(summary_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -248,48 +254,64 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 
--- ─────────────────────────────────────────────
--- Summary DAG (compaction tracking)
--- ─────────────────────────────────────────────
-
+-- Summary DAG nodes
 CREATE TABLE IF NOT EXISTS summaries (
     id           TEXT PRIMARY KEY,
-    kind         TEXT NOT NULL,              -- leaf | condensed
+    kind         TEXT NOT NULL,              -- 'leaf' | 'condensed'
     content      TEXT NOT NULL,
     token_count  INTEGER,
-    parent_id    TEXT REFERENCES summaries(id),
     session_id   TEXT NOT NULL,
     level        INTEGER NOT NULL DEFAULT 1, -- escalation level: 1 | 2 | 3
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
-CREATE INDEX IF NOT EXISTS idx_summaries_parent  ON summaries(parent_id);
 
+-- Junction table: which messages does each summary cover?
+-- A leaf summary covers a contiguous span of messages.
+-- A condensed summary covers one or more leaf summaries.
+CREATE TABLE IF NOT EXISTS summary_sources (
+    summary_id   TEXT NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
+    source_id    TEXT NOT NULL,              -- message.id (leaf) or summaries.id (condensed)
+    source_kind  TEXT NOT NULL,              -- 'message' | 'summary'
+    PRIMARY KEY (summary_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_summary_sources_source ON summary_sources(source_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
+    content, content=summaries, content_rowid=rowid
+);
+CREATE TRIGGER IF NOT EXISTS summaries_ai AFTER INSERT ON summaries BEGIN
+    INSERT INTO summaries_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
 ```
 
-**knowledge.db additions** (run by `KnowledgeGraph::init_schema()`):
+Note: brain.db does not currently enable FK enforcement. Add `PRAGMA foreign_keys = ON` alongside the existing PRAGMA block in `SqliteMemory::open_connection()`. Since brain.db has no existing FKs to violate, this is safe.
 
 ```sql
 -- ─────────────────────────────────────────────
--- Knowledge graph extensions (additive changes to existing schema)
+-- knowledge.db additions (run by KnowledgeGraph::init_schema())
 -- ─────────────────────────────────────────────
 
--- New columns on existing nodes table (ALTER TABLE IF NOT EXISTS):
+-- New columns on existing nodes table (ALTER TABLE ADD COLUMN IF NOT EXISTS):
 --   synthesis     TEXT        -- LLM-compiled summary; NULL = not yet synthesized
---   synthesis_at  TEXT        -- RFC 3339; NULL = stale, needs re-synthesis
+--   synthesis_at  TEXT        -- RFC 3339 timestamp; NULL = stale, needs re-synthesis
 --   embedding     BLOB        -- f32 vector of synthesis text (for unified recall)
+--   updated_at already exists — used by dream cycle to detect staleness
 
--- Node types and relation types become free-form strings (see Phase 3).
--- The nodes.node_type and edges.relation columns are already TEXT in SQLite.
--- The Rust enums (NodeType, Relation) are replaced with validated strings.
--- Well-known defaults (person, company, project, pattern, decision, lesson, etc.)
--- are documented in tool descriptions, not enforced in code.
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS synthesis TEXT;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS synthesis_at TEXT;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS embedding BLOB;
+
+-- Node types and relation types are now free-form lowercase strings.
+-- The NodeType and Relation Rust enums are dropped. Validation: non-empty string,
+-- normalized to lowercase + underscores in code. Well-known defaults documented
+-- in tool descriptions: person, company, project, pattern, decision, lesson, etc.
 
 CREATE TABLE IF NOT EXISTS node_events (
     id                TEXT PRIMARY KEY,
     node_id           TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     content           TEXT NOT NULL,
-    source_message_id TEXT,               -- soft reference to brain.db messages.id (UUID lookup)
+    source_message_id TEXT,               -- soft reference to brain.db messages.id
     session_id        TEXT,
     created_at        TEXT NOT NULL
 );
@@ -306,27 +328,25 @@ END;
 
 ### 5.3 Unified Recall with RRF
 
-Replace the weighted linear merge in the recall path with Reciprocal Rank Fusion across all sources:
+**Where RRF lives:** In `RetrievalPipeline` (`retrieval.rs`), not inside `SqliteMemory::recall()`. `SqliteMemory::recall()` continues to do its hybrid BM25+cosine merge internally. `RetrievalPipeline` is extended to optionally hold a `KnowledgeGraph` handle and a direct `SqliteMemory` reference (for `search_summaries()`), then does cross-source RRF before returning.
 
 ```
-recall(query, limit) =
+RetrievalPipeline::recall(query, limit) =
     sources = [
-        search_memories(query, limit*3),      -- existing: BM25 + cosine on memories table
-        search_nodes(query, limit*3),          -- extended: BM25 + cosine on nodes table
-        search_summaries(query, limit*3),      -- new: BM25 on summaries table
+        memory.recall(query, limit*3),           -- existing: BM25 + cosine on memories table
+        sqlite.search_summaries(query, limit*3),  -- new: BM25 on summaries_fts
+        knowledge.search(query, limit*3),         -- existing+extended: BM25 + cosine on nodes
     ]
+    -- all three run in parallel via tokio::join!
 
-    RRF_score(item) = Σ  1 / (k + rank_j(item))   for each source j
-                     where k = 60
+    RRF_score(item) = Σ  1 / (60 + rank_j(item))   for each source j
 
-    return top `limit` by RRF_score
+    return top `limit` by RRF_score, with time decay applied post-merge
 ```
 
-This replaces the `0.7 * vector + 0.3 * keyword` merge in `vector::hybrid_merge`. RRF operates on rank position, not raw scores — no normalization needed, no weight tuning. The per-source search (BM25, cosine, hybrid) still runs as-is within each source; RRF merges across sources.
+**NULL embedding handling:** `knowledge.search()` checks `WHERE embedding IS NOT NULL` before the cosine path; nodes without embeddings appear in the BM25 ranked list only. Between Phase 4 deployment and Phase 6 (dream cycle), all nodes contribute via BM25. No special-casing needed in the caller.
 
-The three sources query two different SQLite files (`brain.db` and `knowledge.db`) in parallel via `tokio::join!`. Results are converted to a common `MemoryEntry` and merged in Rust. No cross-database SQL needed.
-
-The existing `search_mode` config (bm25 | embedding | hybrid) still applies within each source.
+The existing `search_mode` config (bm25 | embedding | hybrid) applies within each source.
 
 ### 5.4 Structured Context Block
 
@@ -347,53 +367,60 @@ Replace the flat `[Memory context]` injection with structured sections:
 
 ## Session history
 [Summary of earlier turns: discussed deployment options, created PR #42...]
-
 [/Context]
 ```
 
 Assembly logic in `build_context()`:
-1. `recall(user_message, limit=10)` — RRF across all sources
+1. `pipeline.recall(user_message, limit=10)` — RRF across all sources
 2. Apply time decay (Core/node entries exempt) and relevance filter
 3. Partition results by source type
-4. Group knowledge nodes by node_type
+4. Group knowledge nodes by node_type (lowercased)
 5. Format as structured sections: entities first, then facts, then session summaries
 
 ### 5.5 Compaction with Summary DAG
 
-Evolve the existing `ContextCompressor` (don't replace it — same call sites, same signatures):
+Evolve the existing `ContextCompressor` (same struct name, same call signatures):
 
-**Three-level escalation (formalizing the existing multi-pass):**
+**Three-level escalation:**
 
-| Level | Strategy | Trigger |
-|-------|----------|---------|
-| 1 | LLM summarize, preserve_details mode, target T tokens | First attempt |
-| 2 | LLM summarize, bullet_points mode, target T/2 tokens | Level 1 output ≥ input |
-| 3 | Deterministic truncation to 512 chars, no LLM | Level 2 output ≥ input |
+| Level | Strategy | Trigger | Target |
+|-------|----------|---------|--------|
+| 1 | LLM summarize, current prompt | First attempt | ≤ threshold tokens |
+| 2 | LLM summarize, bullet_points only, harder constraints | Level 1 output ≥ input × 0.9 | ≤ threshold/2 tokens |
+| 3 | Deterministic: truncate each source message to 512 chars, no LLM | Level 2 output ≥ input × 0.9 | Always terminates |
 
-Level 3 always terminates — guaranteed convergence.
+Level 3 always terminates — guaranteed convergence regardless of LLM behavior.
+
+**Soft vs. hard threshold — clarification:** Both thresholds are checked synchronously in the main agent loop. "Soft" means checked between turns with no urgency; compaction runs if over threshold, but the agent could still send the turn if it fails. "Hard" means checked immediately before the next LLM call and the call is blocked until compaction brings tokens below the hard limit (or Level 3 fires). No background goroutines; the existing `&mut Vec<ChatMessage>` ownership model is unchanged.
 
 **DAG tracking:** When compacting a message span:
-1. `INSERT INTO summaries (kind='leaf', content=S, session_id, level)`
-2. `UPDATE messages SET summary_id=<id> WHERE id IN (<compacted>)`
-3. Replace compacted messages in history Vec with summary placeholder
+1. `INSERT INTO summaries (kind='leaf', content, session_id, level, created_at)`
+2. `INSERT INTO summary_sources (summary_id, source_id='<msg.id>', source_kind='message')` for each covered message
+3. Replace compacted messages in history Vec with single placeholder: `[SUMMARY:{id}] {text}`
 
 When leaf summaries themselves need compacting (very long sessions):
 1. Run escalation on the leaf summary texts
-2. `INSERT INTO summaries (kind='condensed', parent_id=<leaf_ids>)`
-3. Update leaf rows' parent_id
+2. `INSERT INTO summaries (kind='condensed', session_id, level, created_at)`
+3. `INSERT INTO summary_sources (summary_id=<condensed.id>, source_id=<leaf.id>, source_kind='summary')` for each covered leaf
 
-**Thresholds:** Keep existing `threshold_ratio = 0.50` as soft (async between turns). Add `hard_threshold_ratio = 0.80` (blocking before next LLM call). Below soft threshold, zero overhead.
+The `summary_sources` junction table handles both cases uniformly (a condensed summary covering N leaves inserts N rows). No multi-value FK column needed.
+
+**The compressor no longer writes to the `memories` table Daily category.** The summaries table is the real tracking mechanism. Old code that did `memory.store("compressed_context_...", summary, Daily, ...)` is removed.
 
 ### 5.6 Entity Creation via Consolidation
 
-The agent won't reliably call `knowledge entity_store(...)` during natural conversation. Entity creation must be passive — a side effect of the consolidation pipeline that already runs after every turn.
+Entity creation is passive — a side effect of the consolidation pipeline that already runs fire-and-forget after every turn.
 
-**Per-turn consolidation (evolved):** `consolidate_turn()` currently extracts `history_entry` (Daily) and `memory_update` (Core). Extend the output schema:
+**Separate LLM calls for consolidation + entity extraction:**
+
+The current `consolidate_turn()` makes one LLM call. Phase 3 makes two sequential calls:
+
+1. **Turn summary call** (unchanged): extracts `history_entry` + `memory_update`. Same 4000-char truncation, same system prompt, same model. Output written to `memories` table as before.
+
+2. **Entity extraction call** (new, only when knowledge graph is configured): separate call with its own system prompt and output schema. Input: same truncated turn text + list of existing entity slugs (capped at 100, ordered by recency). Target: small cheap model (or the same model with a tight max_tokens). Output schema:
 
 ```json
 {
-  "history_entry": "Discussed Acme's enterprise pivot with Alice over lunch.",
-  "memory_update": "Alice works at Acme. Acme is pivoting to enterprise.",
   "entities": [
     {"type": "person", "slug": "alice", "fact": "Works at Acme. Had lunch 2026-04-12."},
     {"type": "company", "slug": "acme", "fact": "Pivoting to enterprise per Alice 2026-04-12."}
@@ -404,145 +431,746 @@ The agent won't reliably call `knowledge entity_store(...)` during natural conve
 }
 ```
 
-The consolidation code then:
-1. For each entity: normalize the slug (lowercase, underscores, strip whitespace), search existing nodes by title/slug similarity (BM25 on `nodes_fts`), and either match an existing node or create a new one. Append a `node_events` row with the fact. Mark the node's `synthesis_at = NULL` (stale).
-2. For each relation: resolve slugs to node IDs, upsert edge.
+If no entities are mentioned, the LLM returns `{"entities": [], "relations": []}`. This is fast and cheap when the turn is routine.
 
-**Ontology consistency** is maintained by:
-- **Slug normalization** in code: `"Alice from Acme"` → `"alice_from_acme"`. Enforced at the API boundary, not by convention.
-- **Existing-entity context in the prompt**: The consolidation prompt receives the current list of entity slugs and types (e.g., `"Existing entities: alice (person), acme (company), zeroclaw (project)"`). This nudges the LLM to match against what exists rather than inventing new slugs. Capped at ~100 entities in the prompt to avoid context bloat; ordered by recency.
-- **Dedup at write time**: Before creating a new node, BM25 search for similar titles. If similarity exceeds a threshold (reusing the 0.85 cosine pattern from `conflict.rs`), merge into the existing node instead.
-- **Type normalization**: Lowercase in code. `"Person"` and `"person"` are the same.
+**Slug normalization:** `normalize_slug(s: &str) -> String` — lowercase, collapse whitespace/punctuation to underscores, strip leading/trailing underscores. Enforced at the API boundary for all writes.
 
-**The explicit `knowledge` tool still exists** for deliberate queries, manual creation, and correction. But the passive consolidation path is what builds the graph over time.
+**Entity dedup — two-pass:**
+1. Exact match: `SELECT id FROM nodes WHERE title = ?` using the normalized slug. If found, use that node.
+2. Fuzzy fallback (only when no exact match): cosine similarity between the candidate's text and `nodes.synthesis` or `nodes.content` embeddings. Reuse the 0.85 threshold from `conflict.rs`. Skip if no embeddings exist yet (pre-Phase 6). Create a new node if below threshold.
+
+BM25 is not used for dedup — it's unreliable for short normalized strings. Exact match + cosine is the right combination.
+
+**Note — cosine fallback is inert until Phase 6:** Nodes have no embeddings until the dream cycle synthesizes them. Between Phase 3 and Phase 6 deployment, pass 1 (exact slug match) is the only active dedup path. The cosine pass should be written and wired in Phase 3 but will simply find no embeddings to compare and fall through to creating a new node. Do not treat this as a bug during Phase 3 development.
+
+**Ontology consistency:**
+- All node_type and relation strings are lowercased in code at write time. `"Person"` and `"person"` write identically.
+- The consolidation prompt receives existing entity slugs as context so the LLM matches against what exists.
+- Relations are also lowercased: `"EmployedBy"` → `"employed_by"`.
+
+**The explicit `knowledge` tool still exists** for deliberate queries, manual creation, and correction.
 
 ### 5.7 Dream Cycle as Scheduled Synthesis
 
-The dream cycle is the complement to consolidation: consolidation creates rough entity nodes with individual facts, the dream cycle periodically synthesizes them into coherent summaries.
+Nightly cron job re-synthesizes knowledge graph nodes from their accumulated `node_events`:
 
-**Nightly cron job:** Re-synthesize knowledge graph nodes from their accumulated `node_events`:
-
-1. Query nodes where `synthesis_at IS NULL OR synthesis_at < updated_at`, ordered by update recency
-2. For each (capped at 20 per run):
+1. Query stale nodes: `WHERE synthesis_at IS NULL OR synthesis_at < updated_at`
+2. Order by `updated_at DESC` (most recently active first)
+3. **First-run cap:** if `COUNT(stale) > 5 × dream_cycle_max_per_run`, process `5 × max` on this run and log a warning. After the first run, cap applies as normal. This prevents weeks-long catch-up backlog on initial deployment.
+4. For each node (up to cap):
    a. Load all `node_events` chronologically
    b. LLM call: "Synthesize everything known about this {node_type}. Preserve all facts, dates, names."
    c. `UPDATE nodes SET synthesis=<result>, synthesis_at=now()`
    d. Embed synthesis text → `UPDATE nodes SET embedding=<blob>`
-
-This uses the existing cron infrastructure (`cron/scheduler.rs` with `JobType::Agent`). The consolidation module gains a `synthesize_stale_entities()` function called by the cron job.
+5. Mark node's `synthesis_at = NULL` whenever a new `node_events` row is appended (trigger or application code)
 
 ---
 
 ## 6. Implementation Plan
 
-Phases are ordered by dependency and value. Each phase is independently shippable.
+Phases are ordered by dependency and value. Each phase is independently shippable and verifiable. All tests are Rust `#[tokio::test]` in the relevant crate's `tests` module unless noted.
+
+---
+
+### Phase 0: Add `id` to `ChatMessage` (Pre-flight)
+
+**File:** `crates/zeroclaw-api/src/provider.rs`
+
+**Why this comes first:** `ChatMessage` currently has only `role` and `content`. Phase 1 needs to write each message to the `messages` table as it's appended to the history Vec, and the table requires a stable UUID per row. Without an `id` field on the struct, the only alternatives are a side-channel `HashMap<usize, String>` in the loop (fragile — every push site needs two lines and they can drift) or writing at turn-end (less crash-safe). Adding `id` to the struct is the right fix. It also unblocks Phase 2 (`summary_sources` links to message IDs) and Phase 3 (`source_message_id` threading in consolidation).
+
+#### What to build
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    #[serde(default = "new_message_id")]
+    pub id: String,
+    pub role: String,
+    pub content: String,
+}
+
+fn new_message_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { id: new_message_id(), role: "system".into(), content: content.into() }
+    }
+    // ... user(), assistant(), tool() same pattern
+}
+```
+
+`#[serde(default = "new_message_id")]` means existing session JSONL files and any serialized `ChatMessage` without an `id` field deserializes correctly — old messages get a fresh UUID on read. Providers send only `role` and `content` to the API; `id` is ignored by all provider adapters and never forwarded upstream.
+
+No other files need changes in this phase. The constructors generate IDs automatically so every existing callsite (`ChatMessage::user(...)`, etc.) gets an ID without modification.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-api/src/provider.rs — #[cfg(test)] mod tests
+
+#[test]
+fn chat_message_constructor_generates_unique_ids() {
+    let a = ChatMessage::user("hello");
+    let b = ChatMessage::user("hello");
+    assert_ne!(a.id, b.id);  // same content, different IDs
+}
+
+#[test]
+fn chat_message_id_survives_round_trip() {
+    let msg = ChatMessage::assistant("response");
+    let json = serde_json::to_string(&msg).unwrap();
+    let restored: ChatMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg.id, restored.id);
+}
+
+#[test]
+fn chat_message_deserializes_without_id_field() {
+    // Simulates loading a legacy session JSONL entry that has no id field
+    let json = r#"{"role":"user","content":"hello"}"#;
+    let msg: ChatMessage = serde_json::from_str(json).unwrap();
+    assert!(!msg.id.is_empty());  // gets a fresh UUID
+    assert_eq!(msg.role, "user");
+}
+```
+
+**Deliverable:** `ChatMessage` has a stable UUID from construction. All subsequent phases can use `msg.id` directly.
+
+#### Implementation Notes
+
+**Completed 2026-04-13.**
+
+Changes made:
+- `crates/zeroclaw-api/Cargo.toml` — added `uuid = { version = "1", features = ["v4"] }`
+- `crates/zeroclaw-api/src/provider.rs` — added `new_message_id()` helper, `Default` impl for `ChatMessage`, `id` field with `#[serde(default = "new_message_id")]`, updated all four constructors
+- `crates/zeroclaw-infra/Cargo.toml` — added `uuid` dep (session_sqlite.rs constructs ChatMessage directly)
+- `crates/zeroclaw-infra/src/session_sqlite.rs` — added `id: uuid::Uuid::new_v4().to_string()` to struct literal
+- `crates/zeroclaw-providers/src/multimodal.rs` — two struct literals updated with `..Default::default()`
+- `crates/zeroclaw-runtime/src/agent/context_analyzer.rs`, `context_compressor.rs`, `history_pruner.rs` — test helper `msg()`/`make_message()` functions updated with `..Default::default()`
+
+Deviation from plan: The plan noted provider files wouldn't need changes since constructors are used. In practice, `multimodal.rs` constructs `ChatMessage` via struct literal (not constructors) when normalizing messages. `zeroclaw-infra/session_sqlite.rs` also uses struct literal when loading from SQLite. All fixed with `..Default::default()` struct update syntax rather than adding uuid deps to every provider crate. The `Default` impl (added to support this) generates a UUID, keeping the invariant that every `ChatMessage` always has a valid UUID regardless of construction path.
+
+Test results: 1821 tests passing across `zeroclaw-api`, `zeroclaw-memory`, `zeroclaw-runtime`. All three Phase 0 tests green.
+
+---
 
 ### Phase 1: Immutable Message Store
 
-**Files:** `loop_.rs`, `sqlite.rs`, `history.rs`
+**Files:** `crates/zeroclaw-memory/src/sqlite.rs`, `crates/zeroclaw-runtime/src/agent/loop_.rs`
 
-**What:**
-- Add `messages` and `messages_fts` tables to `init_schema()`
-- Add `append_message(&self, role, content, session_id, token_count) -> String` to `SqliteMemory`
-- In the agent loop, after each complete turn, write all messages to the `messages` table
-- The `messages` table is the durable record; the in-memory `history` Vec remains the fast path
-- FTS5 trigger keeps `messages_fts` in sync automatically
-- Return the message UUID so downstream code (entity events in Phase 3) can link to it
-- **Remove auto-save.** Set `auto_save = false` when the `messages` table is active. The `messages` table is a strictly better replacement — it stores every message verbatim with role, session_id, timestamps, and FTS indexing, versus auto-save which only stored user messages ≥20 chars as Conversation entries with UUID keys that the recall pipeline then had to filter out (`should_skip_autosave_content()`, `is_assistant_autosave_key()`). Those filters can also be removed.
+#### What to build
 
-**Key design decision:** The `messages` table supplements, not replaces, the session JSONL files. Channel sessions keep their append-only JSONL (it's the channel adapter's persistence). The `messages` table is the searchable index over all sessions. This avoids changing any channel adapter code.
+**`SqliteMemory` additions:**
 
-**Where each message now lives and why:**
+```rust
+/// Append a single message to the immutable store. Returns the message UUID.
+/// This is a synchronous operation (called from the agent loop).
+pub fn append_message(
+    &self,
+    id: &str,          // caller generates UUID before pushing to history Vec
+    session_id: &str,
+    role: &str,        // "user" | "assistant" | "system" | "tool"
+    content: &str,
+    token_count: Option<i64>,
+) -> anyhow::Result<()>
 
-| Store | What it holds | Purpose |
-|-------|--------------|---------|
-| Session JSONL / session.json | Verbatim messages | Channel adapter persistence (unchanged) |
-| `messages` table | Verbatim messages | Searchable immutable history, provenance links |
-| `memories` table (via consolidation) | LLM-extracted summaries + facts | Cross-session knowledge (Daily + Core) |
-| `node_events` table (via consolidation) | Entity-specific facts | Entity timelines |
+/// Regex search over verbatim message content.
+/// Used by lcm_grep (Phase 5) — defined here for co-location with the table.
+pub fn search_messages(
+    &self,
+    pattern: &str,          // compiled regex
+    session_id: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<MessageEntry>>
+```
 
-The JSONL / `messages` duplication is accepted (different purposes, different systems — see Q1). The old auto-save Conversation entries are eliminated — they were a weaker version of what `messages` now provides.
+New `MessageEntry` struct:
+```rust
+pub struct MessageEntry {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+    pub summary_id: Option<String>,  // set in Phase 2
+}
+```
 
-**Deliverable:** Every turn is durably written to `messages`. Auto-save noise removed. Raw history is searchable after session end.
+**Schema:** Add `messages`, `messages_fts` tables via `init_schema()` (as defined in §5.2). Add `PRAGMA foreign_keys = ON` to the PRAGMA block in `open_connection()`.
+
+**Write timing — per-message, not per-turn:** In the agent loop, call `append_message(msg.id, ...)` immediately after each `history.push(msg)`. Because `ChatMessage` now carries its own UUID (Phase 0), no side-channel is needed — the ID is on the struct. Crashes mid-turn preserve all messages up to the crash point. `consolidate_turn()` receives the user and assistant message IDs from the most recent turn directly off the `ChatMessage` values it was already given.
+
+**Remove auto-save:** Delete the `config.memory.auto_save` branches in `loop_.rs` (two occurrences: one for interactive mode, one for channel mode). Delete `should_skip_autosave_content()`, `is_assistant_autosave_key()`, `autosave_memory_key()`. Delete the `AUTOSAVE_MIN_MESSAGE_CHARS` constant. The `messages` table replaces this entirely — every message is stored verbatim with role, session_id, and FTS indexing.
+
+The `build_context()` filter `is_assistant_autosave_key()` can also be removed since those keys will no longer be created.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-memory/src/sqlite.rs — #[cfg(test)] mod tests
+
+#[tokio::test]
+async fn messages_append_and_retrieve() {
+    // append_message writes a row; SELECT finds it by id
+}
+
+#[tokio::test]
+async fn messages_fts_searchable() {
+    // append a message with known content; FTS search matches it
+}
+
+#[tokio::test]
+async fn messages_are_immutable() {
+    // second INSERT with same id fails (PRIMARY KEY violation)
+}
+
+#[tokio::test]
+async fn messages_session_filter() {
+    // two session_ids; search_messages with session filter returns only matching session
+}
+
+#[tokio::test]
+async fn messages_role_preserved() {
+    // append user/assistant/tool roles; verify role field round-trips correctly
+}
+
+// crates/zeroclaw-runtime/src/agent/tests.rs
+
+#[tokio::test]
+async fn auto_save_code_paths_removed() {
+    // compile-time: verify should_skip_autosave_content is gone
+    // runtime: run a turn, verify no 'user_msg_*' or 'assistant_resp_*' keys in memories
+}
+
+#[tokio::test]
+async fn messages_written_per_message_not_per_turn() {
+    // mock a turn that crashes after user message but before assistant response
+    // verify user message is in messages table; assistant is not
+    // (tests crash-safety of per-message writes)
+}
+```
+
+**Deliverable:** Every turn is durably written to `messages` per-message. Auto-save noise removed. Raw history is searchable via FTS after session end. `build_context()` cleanup passes.
 
 ---
 
 ### Phase 2: Summary DAG Compressor
 
-**Files:** `context_compressor.rs`, `sqlite.rs`
+**Files:** `crates/zeroclaw-runtime/src/agent/context_compressor.rs`, `crates/zeroclaw-memory/src/sqlite.rs`
 
-**What:**
-- Add `summaries` table to `init_schema()`
-- Evolve `ContextCompressor` (keep same struct name and call signatures):
-  - Add three-level escalation (formalize existing multi-pass)
-  - On compaction: INSERT summary into `summaries` table, UPDATE `messages.summary_id` for covered messages
-  - Replace compacted messages in history Vec with placeholder `[SUMMARY:{id}] {text}`
-  - Add condensed summary support: when leaf summaries accumulate, compact them too
-- Add soft/hard threshold distinction (async vs blocking compaction)
+#### What to build
 
-**Key change from current behavior:** The `memories` table Daily entry still gets written (backward compat), but the `summaries` table is the real tracking mechanism with parent pointers and provenance.
+**`SqliteMemory` additions:**
 
-**Deliverable:** Lossless compaction. Original messages always recoverable from `messages` table. Summary DAG tracks the compaction chain. Three-level escalation guarantees convergence.
+```rust
+/// Insert a new summary node. Returns its id.
+pub fn insert_summary(
+    &self,
+    id: &str,
+    kind: &str,               // "leaf" | "condensed"
+    content: &str,
+    token_count: Option<i64>,
+    session_id: &str,
+    level: u32,
+) -> anyhow::Result<()>
+
+/// Link a summary to the messages or summaries it covers.
+pub fn link_summary_sources(
+    &self,
+    summary_id: &str,
+    sources: &[(&str, &str)],  // (source_id, source_kind: "message" | "summary")
+) -> anyhow::Result<()>
+
+/// BM25 search over summaries content. Used by Phase 4 RRF.
+pub fn search_summaries(
+    &self,
+    query: &str,
+    limit: usize,
+    session_id: Option<&str>,
+) -> anyhow::Result<Vec<SummaryEntry>>
+```
+
+New `SummaryEntry` struct (for RRF integration):
+```rust
+pub struct SummaryEntry {
+    pub id: String,
+    pub content: String,
+    pub session_id: String,
+    pub level: u32,
+    pub created_at: String,
+    pub score: Option<f64>,
+}
+```
+
+**Schema:** Add `summaries`, `summaries_fts`, `summary_sources` tables via `init_schema()` (as defined in §5.2).
+
+**`ContextCompressor` evolution:**
+
+New field: `memory_sqlite: Option<Arc<SqliteMemory>>` — set via `.with_sqlite_memory()` builder method. This is separate from the existing `memory: Option<Arc<dyn Memory>>` which stays for the old path (and will be removed in Phase 7 cleanup).
+
+Three-level escalation replaces the current `for _ in 0..max_passes` loop:
+
+```
+Level 1: current LLM summarization call (unchanged prompt)
+  → if output_tokens >= input_tokens × 0.9: try Level 2
+Level 2: LLM call with tighter prompt: "bullet points only, max 10 items, half the length"
+  → if output_tokens >= input_tokens × 0.9: use Level 3
+Level 3: deterministic — truncate each source message content to 512 chars,
+         join with newlines, no LLM call
+```
+
+After any level produces a summary:
+1. Generate a summary UUID
+2. Call `insert_summary(id, kind="leaf", content, ..., level=<1|2|3>)`
+3. Call `link_summary_sources(summary_id, [(msg.id, "message") for msg in span])`
+4. Replace the span in the history Vec with: `ChatMessage::assistant(format!("[SUMMARY:{id}]\n\n{content}"))`
+
+**Remove the old `memories` Daily write:** Delete the `memory.store("compressed_context_...", ...)` call in `compress_once()`. The summaries table is the real record.
+
+**Condensed summary support** (for very long sessions where leaf summaries accumulate):
+- Trigger: when `summaries` for the current session exceed a configurable count (default: 10)
+- Run escalation over the leaf summary texts
+- Insert as `kind='condensed'`
+- Link via `link_summary_sources` with `source_kind='summary'`
+
+**Soft/hard threshold configuration** (new config fields):
+```toml
+[memory.compression]
+threshold_ratio = 0.50       # existing — soft threshold
+hard_threshold_ratio = 0.80  # new — blocking pre-LLM threshold
+```
+
+Both checked synchronously in the main loop. Soft: checked between turns, no blocking. Hard: checked immediately before `provider.chat(...)`, blocks until compaction succeeds or Level 3 fires.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-runtime/src/agent/context_compressor.rs — tests at bottom of file
+
+#[tokio::test]
+async fn level1_compresses_normally() {
+    // mock provider returns short summary; verify Level 1 fires, Level 2 never called
+}
+
+#[tokio::test]
+async fn level2_fires_when_level1_output_not_smaller() {
+    // mock provider: Level 1 returns same-length output, Level 2 returns shorter output
+    // verify summary stored with level=2
+}
+
+#[tokio::test]
+async fn level3_fires_deterministically() {
+    // mock provider: Level 1 and 2 both return same-length output
+    // verify Level 3 fires; summary stored with level=3; no LLM call beyond Level 2
+}
+
+#[tokio::test]
+async fn level3_always_terminates_with_very_long_input() {
+    // 10,000 char messages; Level 3 must produce output shorter than input
+}
+
+#[tokio::test]
+async fn summary_dag_insert() {
+    // run compression; verify summaries table has 1 row with correct kind/level
+}
+
+#[tokio::test]
+async fn summary_sources_link_messages() {
+    // compress a span of 5 messages; verify summary_sources has 5 rows linking message ids
+}
+
+#[tokio::test]
+async fn condensed_summary_links_leaves() {
+    // create 10 leaf summaries; trigger condensed summary; verify summary_sources
+    // links all leaf summary ids with source_kind='summary'
+}
+
+#[tokio::test]
+async fn summaries_fts_searchable() {
+    // insert a summary with known content; search_summaries returns it
+}
+
+#[tokio::test]
+async fn history_vec_contains_placeholder_after_compression() {
+    // after compression, history contains exactly one [SUMMARY:{id}] message for the span
+}
+
+#[tokio::test]
+async fn old_memories_daily_write_removed() {
+    // run compression; verify no 'compressed_context_*' keys in memories table
+}
+
+#[tokio::test]
+async fn hard_threshold_blocks_before_llm_call() {
+    // build history at 85% of context window
+    // verify compress_if_needed is called before provider.chat() is invoked
+}
+```
+
+**Deliverable:** Lossless compaction. Original messages always recoverable from `messages` table. Summary DAG tracks the full compaction chain. Three-level escalation guarantees convergence. Condensed summaries handle very long sessions.
 
 ---
 
 ### Phase 3: Entity-Oriented Knowledge Graph + Consolidation Integration
 
-**Files:** `knowledge_graph.rs`, `knowledge_tool.rs`, `consolidation.rs`
+**Files:** `crates/zeroclaw-memory/src/knowledge_graph.rs`, `crates/zeroclaw-tools/src/knowledge_tool.rs`, `crates/zeroclaw-memory/src/consolidation.rs`
 
-**What — schema changes:**
-- **Replace `NodeType` and `Relation` enums with free-form strings.** The `nodes.node_type` and `edges.relation` columns are already `TEXT` in SQLite — the enum is only enforced at the Rust API boundary. Drop `NodeType::parse()` / `Relation::parse()` validation and accept any string. Provide well-known defaults (`person`, `company`, `project`, `pattern`, `decision`, `lesson`, `expert`, `technology`, etc.) in tool descriptions and system prompts so the LLM knows what conventions exist, but don't enforce them in code. This means the agent can track restaurants, books, medical providers, or anything else without a code change.
-- Add columns to `nodes`: `synthesis TEXT`, `synthesis_at TEXT`, `embedding BLOB`
-- Add `node_events` table with soft FK to `nodes` (in knowledge.db) and soft reference to `messages` (in brain.db)
+#### What to build
 
-**What — KnowledgeGraph API extensions:**
-- `add_event(node_id, content, source_message_id, session_id)` — append to timeline
-- `get_with_timeline(node_id, event_limit)` — returns node + recent events
-- `list_stale_nodes()` — nodes needing re-synthesis
-- `update_synthesis(node_id, synthesis_text, embedding)` — called by dream cycle
-- `find_or_create_by_slug(slug, node_type, title)` — dedup-aware upsert: BM25 search for similar slugs/titles, return existing node if similarity > threshold, else create. Used by consolidation.
-- `list_entity_slugs(limit)` — returns `[(slug, node_type)]` ordered by recency, for injection into the consolidation prompt
+**Drop the `NodeType` and `Relation` enums:**
 
-**What — consolidation integration (the primary entity creation path):**
-- Extend `ConsolidationResult` to include `entities: Vec<EntityMention>` and `relations: Vec<RelationMention>`
-- Extend the consolidation LLM prompt (see §5.6) to extract entities and relations
-- After extraction, for each entity: normalize slug → `find_or_create_by_slug()` → `add_event()` with the fact. Mark `synthesis_at = NULL`.
-- After extraction, for each relation: resolve slugs to node IDs → upsert edge.
-- The consolidation prompt receives existing entity slugs as context (capped at ~100, ordered by recency) so the LLM matches against what exists.
+Delete `NodeType`, `Relation`, their `as_str()` and `parse()` impls. Replace with `String` in `KnowledgeNode` and `KnowledgeEdge`. Add:
 
-**What — knowledge tool extensions (the explicit/manual path):**
-- `entity_store(type, slug, content)` — creates/updates entity node + appends event. `type` is any string.
-- `entity_get(slug)` — returns synthesis + recent timeline
-- `entity_list(type?)` — list entities, optionally filtered by type
-- Existing knowledge tool actions (capture, search, relate, etc.) continue to work unchanged
+```rust
+/// Normalize a node type or relation string: lowercase, collapse non-alphanumeric to underscores,
+/// strip leading/trailing underscores.
+pub fn normalize_type(s: &str) -> String
 
-**Key decisions:**
+/// Normalize a slug for entity identity: same rules as normalize_type.
+pub fn normalize_slug(s: &str) -> String
+```
 
-*Consolidation is the primary entity creation path.* The agent won't reliably call tools to create entities during natural conversation. Instead, the per-turn consolidation pipeline (which already runs fire-and-forget after every turn) extracts entity mentions and writes them to the knowledge graph automatically. The explicit `knowledge` tool exists for deliberate queries, manual creation, and correction — but the passive consolidation path is what builds the graph over time.
+Both applied at all write boundaries. The schema columns (`node_type`, `relation`) are already `TEXT NOT NULL` in SQLite — no migration needed.
 
-*No hardcoded types.* Node types and relation types are free-form strings, not enums. The schema is `TEXT NOT NULL`, validated only for non-empty. Well-known types are conventions, not constraints. This is critical for a personal assistant — you can't anticipate every kind of entity a user will care about.
+**Schema migration in `KnowledgeGraph::init_schema()`:**
 
-*Ontology consistency via normalization + dedup.* Slug normalization (lowercase, underscores) is enforced in code. Existing-entity context in the consolidation prompt nudges the LLM toward consistency. Dedup at write time catches what the LLM misses.
+Add the three columns to `nodes` and create `node_events` + `node_events_fts` (as defined in §5.2). Use `ALTER TABLE ADD COLUMN IF NOT EXISTS` for the new columns so re-running init is safe.
 
-**Deliverable:** The knowledge graph can represent any kind of entity with synthesis + timeline. Entities are created automatically via consolidation and manually via tools. No code changes needed to track new entity types. Existing knowledge graph features unchanged.
+**New `KnowledgeGraph` methods:**
+
+```rust
+/// Append an event to an entity's timeline.
+pub fn add_event(
+    &self,
+    node_id: &str,
+    content: &str,
+    source_message_id: Option<&str>,  // soft reference to brain.db messages.id
+    session_id: Option<&str>,
+) -> anyhow::Result<String>  // returns event id
+
+/// Returns the node plus its N most recent events.
+pub fn get_with_timeline(
+    &self,
+    node_id: &str,
+    event_limit: usize,
+) -> anyhow::Result<Option<(KnowledgeNode, Vec<NodeEvent>)>>
+
+/// Find a node by exact slug/title match, then cosine fallback.
+///
+/// Pass 1: SELECT id FROM nodes WHERE title = normalize_slug(slug)
+/// Pass 2 (only if no exact match and embeddings available):
+///   cosine similarity between candidate embedding and existing nodes.synthesis embeddings;
+///   return existing node if similarity >= threshold (default 0.85)
+/// Pass 3: create a new node if no match found.
+/// Returns (node_id, created: bool)
+pub fn find_or_create_by_slug(
+    &self,
+    slug: &str,
+    node_type: &str,
+    title: &str,
+    initial_content: &str,
+) -> anyhow::Result<(String, bool)>
+
+/// Nodes where synthesis_at IS NULL or synthesis_at < updated_at.
+/// Ordered by updated_at DESC (most recently active first).
+pub fn list_stale_nodes(&self, limit: usize) -> anyhow::Result<Vec<KnowledgeNode>>
+
+/// Update synthesis text and embedding after dream cycle.
+pub fn update_synthesis(
+    &self,
+    node_id: &str,
+    synthesis: &str,
+    embedding: Option<&[f32]>,
+) -> anyhow::Result<()>
+
+/// Returns [(slug, node_type)] ordered by updated_at DESC, for consolidation prompt context.
+pub fn list_entity_slugs(&self, limit: usize) -> anyhow::Result<Vec<(String, String)>>
+```
+
+New `NodeEvent` struct:
+```rust
+pub struct NodeEvent {
+    pub id: String,
+    pub node_id: String,
+    pub content: String,
+    pub source_message_id: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+```
+
+**Consolidation integration:**
+
+Extend `consolidate_turn()` signature:
+
+```rust
+pub async fn consolidate_turn(
+    provider: &dyn Provider,
+    model: &str,
+    memory: &dyn Memory,
+    knowledge: Option<&KnowledgeGraph>,  // None = skip entity extraction
+    user_message: &str,
+    assistant_response: &str,
+) -> anyhow::Result<()>
+```
+
+Two sequential LLM calls inside:
+1. Existing call: `history_entry` + `memory_update` (unchanged)
+2. Entity extraction call (only when `knowledge.is_some()`):
+   - Build entity context: `knowledge.list_entity_slugs(100)` → format as "Existing entities: alice (person), acme (company), ..."
+   - System prompt: focused on entity/relation extraction (see §5.6 example schema)
+   - Input: truncated turn text (4000 chars max, same as call 1) + entity context
+   - Parse `EntityExtractionResult { entities: Vec<EntityMention>, relations: Vec<RelationMention> }`
+   - For each entity: `normalize_slug(slug)` → `find_or_create_by_slug()` → `add_event(content=fact, source_message_id, session_id)` → mark `synthesis_at = NULL` (done automatically by `add_event` via trigger or explicit UPDATE)
+   - For each relation: `normalize_type(relation)` → resolve slugs to node IDs → upsert edge
+
+Add a `AFTER INSERT ON node_events` trigger to brain.db that sets `nodes.synthesis_at = NULL` and `nodes.updated_at = now()` on the corresponding node — so the dream cycle picks it up automatically.
+
+Actually — these tables are in `knowledge.db`, not `brain.db`. The trigger is added to `KnowledgeGraph::init_schema()`:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS node_events_mark_stale AFTER INSERT ON node_events BEGIN
+    UPDATE nodes SET synthesis_at = NULL, updated_at = datetime('now')
+    WHERE id = new.node_id;
+END;
+```
+
+**Knowledge tool updates:**
+
+Add new actions:
+- `entity_store(type, slug, content)` — `normalize_slug()` + `find_or_create_by_slug()` + `add_event()`
+- `entity_get(slug)` — returns synthesis + recent timeline from `get_with_timeline()`
+- `entity_list(type?)` — list entities, optionally filtered by normalized type
+
+Existing actions (capture, search, relate, etc.) remain. The `capture` action switches from `NodeType::parse()` to `normalize_type()`.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-memory/src/knowledge_graph.rs — tests
+
+#[test]
+fn slug_normalization() {
+    assert_eq!(normalize_slug("Alice from Acme"), "alice_from_acme");
+    assert_eq!(normalize_slug("  LeadEngineer "), "leadengineer");
+    assert_eq!(normalize_slug("my-company.inc"), "my_company_inc");
+}
+
+#[test]
+fn node_type_normalization() {
+    assert_eq!(normalize_type("Person"), "person");
+    assert_eq!(normalize_type("EmployedBy"), "employedby");
+}
+
+#[test]
+fn find_or_create_exact_match() {
+    // create node with title "alice"; find_or_create_by_slug("alice", ...) returns same id, created=false
+}
+
+#[test]
+fn find_or_create_new_slug() {
+    // find_or_create_by_slug for unknown slug; returns new id, created=true
+}
+
+#[test]
+fn find_or_create_cosine_dedup() {
+    // create node with synthesis embedding; find_or_create with semantically similar
+    // but differently-slugged title returns existing node (cosine >= 0.85)
+}
+
+#[test]
+fn add_event_marks_node_stale() {
+    // create node, set synthesis_at = now(); add_event; verify synthesis_at IS NULL
+}
+
+#[test]
+fn list_stale_nodes_ordering() {
+    // create 3 nodes with varying updated_at; verify list_stale_nodes returns most recent first
+}
+
+#[test]
+fn relation_type_normalized_at_write() {
+    // add_edge with relation "EmployedBy"; verify stored as "employedby"
+}
+
+#[test]
+fn duplicate_relation_upsert() {
+    // add same edge twice; only one row in edges table
+}
+
+#[tokio::test]
+async fn consolidation_creates_entities() {
+    // mock provider returns known entity extraction JSON
+    // verify nodes and node_events created in knowledge graph
+}
+
+#[tokio::test]
+async fn consolidation_entity_slug_context_included() {
+    // pre-populate knowledge graph with entities
+    // verify the entity extraction LLM call includes "Existing entities: ..." in prompt
+}
+
+#[tokio::test]
+async fn consolidation_skips_entity_extraction_when_knowledge_none() {
+    // call consolidate_turn with knowledge=None; verify only 1 LLM call made (not 2)
+}
+
+#[tokio::test]
+async fn consolidation_handles_malformed_entity_json() {
+    // mock provider returns garbage JSON for entity extraction
+    // verify consolidation doesn't panic, returns Ok(()), main history entry still written
+}
+```
+
+**Deliverable:** The knowledge graph can represent any kind of entity with synthesis + timeline. Entities are created automatically via consolidation and manually via tools. No code changes needed to track new entity types.
 
 ---
 
 ### Phase 4: Unified Recall with RRF
 
-**Files:** `sqlite.rs`, `retrieval.rs`, `vector.rs`, `loop_.rs`
+**Files:** `crates/zeroclaw-memory/src/retrieval.rs`, `crates/zeroclaw-runtime/src/agent/loop_.rs`
 
-**What:**
-- Add `rrf_merge(ranked_lists, k=60) -> Vec<MemoryEntry>` to `retrieval.rs`
-- In `SqliteMemory::recall()`, query three sources in parallel:
-  1. `memories` table (existing search pipeline)
-  2. `nodes` table (BM25 on `nodes_fts` + cosine on `nodes.embedding`)
-  3. `summaries` table (BM25 on summary content, filtered by session)
-- Merge results with RRF instead of weighted linear combination
-- Convert knowledge graph `SearchResult` to `MemoryEntry` for uniform handling
-- Refactor `build_context()` to produce structured `[Context]` block with sections
+**Scope note:** `build_context()` in `loop_.rs` has three call sites (lines ~2448, ~2732, ~3287) that all change signature from `(mem: &dyn Memory, ...)` to `(pipeline: &RetrievalPipeline, ...)`. All three must be updated together — this is the full Phase 4 diff in `loop_.rs`.
 
-**Deliverable:** Single `recall()` call searches all storage layers. RRF produces robust ranked results. Context injection is structured and includes entity knowledge.
+#### What to build
+
+**`rrf_merge()` free function in `retrieval.rs`:**
+
+```rust
+/// Reciprocal Rank Fusion across multiple ranked result lists.
+///
+/// `ranked_lists`: each inner Vec is already sorted best-first.
+/// Items are identified by their id field.
+/// k=60 is the standard constant from the original paper.
+pub fn rrf_merge(
+    ranked_lists: Vec<Vec<RrfEntry>>,
+    limit: usize,
+    k: usize,  // default 60
+) -> Vec<RrfEntry>
+
+pub struct RrfEntry {
+    pub id: String,
+    pub content: String,
+    pub source: RrfSource,
+    pub original_score: Option<f64>,
+    pub rrf_score: f64,   // filled by rrf_merge
+    // metadata for structured context block assembly
+    pub node_type: Option<String>,  // Some if from knowledge graph
+    pub key: Option<String>,        // Some if from memories table
+    pub created_at: String,
+}
+
+pub enum RrfSource { Memory, Summary, KnowledgeNode }
+```
+
+**`RetrievalPipeline` extension:**
+
+Add optional fields:
+```rust
+pub struct RetrievalPipeline {
+    memory: Arc<dyn Memory>,
+    sqlite: Option<Arc<SqliteMemory>>,          // for search_summaries()
+    knowledge: Option<Arc<KnowledgeGraph>>,      // for search()
+    config: RetrievalConfig,
+    hot_cache: Mutex<HashMap<String, CachedResult>>,
+}
+```
+
+Builder methods: `.with_sqlite(Arc<SqliteMemory>)`, `.with_knowledge(Arc<KnowledgeGraph>)`.
+
+When both are present, `RetrievalPipeline::recall()` runs three source queries in parallel via `tokio::join!` and merges with `rrf_merge()`. When only `memory` is present (old behavior), falls back to the existing single-source path. The hot cache layer wraps the entire unified result.
+
+**Cache key must include a source fingerprint.** The current key is `"query:limit:session_id:namespace"`. After Phase 4, a pipeline with `knowledge` configured returns different results than one without — a warm cache from before Phase 4 would serve stale single-source results. Add a `sources` bitmask to the key (e.g., `0b001` = memory-only, `0b111` = all three sources). Compute it once in `RetrievalPipeline::new()` and store it as a field:
+
+```rust
+fn source_fingerprint(sqlite: bool, knowledge: bool) -> u8 {
+    (1) | ((sqlite as u8) << 1) | ((knowledge as u8) << 2)
+}
+```
+
+Append `:{fingerprint}` to the cache key string.
+
+**`build_context()` evolution in `loop_.rs`:**
+
+1. Call `pipeline.recall(user_msg, limit=10)`
+2. Partition `RrfEntry` results by `source`
+3. Apply time decay to `Memory` + `Summary` results (Core/node entries exempt)
+4. Filter by `min_relevance_score`
+5. Assemble structured `[Context]` block (§5.4)
+
+Remove the old `[Memory context]` block format and the `is_assistant_autosave_key()` / `should_skip_autosave_content()` filters (already cleaned up in Phase 1).
+
+**NULL embedding graceful degradation:** `KnowledgeGraph::search()` already uses FTS5 BM25 as its primary search path. The cosine path is a secondary re-ranking step that checks `WHERE embedding IS NOT NULL`. Nodes without embeddings participate in BM25 ranking only. This is already the right behavior and requires no special case in the caller.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-memory/src/retrieval.rs — tests
+
+#[test]
+fn rrf_merge_empty_sources() {
+    let result = rrf_merge(vec![], 10, 60);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn rrf_merge_single_source_preserves_order() {
+    // 5 items in one source; rrf_merge with limit=3 returns top 3 in same order
+}
+
+#[test]
+fn rrf_merge_cross_source_fusion() {
+    // item appearing in 2 of 3 sources scores higher than item in only 1
+}
+
+#[test]
+fn rrf_merge_respects_limit() {
+    // 10 items across sources; rrf_merge(limit=3) returns exactly 3
+}
+
+#[test]
+fn rrf_score_formula() {
+    // rank 0 in one source: score = 1/(60+1) = 0.01639...
+    // verify formula matches paper: Σ 1/(k + rank_j) where rank is 0-indexed
+}
+
+#[tokio::test]
+async fn unified_recall_queries_all_three_sources() {
+    // mock SqliteMemory, KnowledgeGraph; verify all three are called
+    // (use call counters / Arc<AtomicUsize>)
+}
+
+#[tokio::test]
+async fn unified_recall_falls_back_to_single_source() {
+    // pipeline without sqlite/knowledge configured; verify only memory queried
+}
+
+#[tokio::test]
+async fn null_embedding_node_appears_via_bm25() {
+    // create node with no embedding; recall for matching query returns that node
+}
+
+// crates/zeroclaw-runtime/src/agent/loop_.rs — tests
+
+#[tokio::test]
+async fn build_context_structured_block() {
+    // pre-populate memory with Core entries and a knowledge node (type="person")
+    // build_context output contains [Context], ## People section, ## Facts section
+}
+
+#[tokio::test]
+async fn build_context_entities_before_facts() {
+    // mixed results; verify node_type groups appear before flat memories
+}
+
+#[tokio::test]
+async fn build_context_empty_sections_omitted() {
+    // only Core memories, no knowledge nodes; verify no empty ## People section in output
+}
+```
+
+**Deliverable:** Single `recall()` call searches all storage layers. RRF produces robust ranked results. Structured context block. Knowledge graph participates in every turn's context automatically.
 
 ---
 
@@ -550,71 +1178,256 @@ The JSONL / `messages` duplication is accepted (different purposes, different sy
 
 **Files:** New `crates/zeroclaw-tools/src/lcm_grep.rs`, tool registration
 
-**What:**
-- Regex search over the verbatim `messages` table
-- Parameters: `pattern` (regex), `session_id` (optional filter), `limit` (default 20, max 50)
-- Results annotated with covering summary_id (or "active" if NULL)
-- Register SQLite `regexp` function via rusqlite
-- Available to all agents (no sub-agent restriction)
+#### What to build
 
-**Why no `lcm_expand`:** The swarm tool spawns stateless agents — they get a single prompt, not a full tool-calling loop with history. There's no meaningful sub-agent context to restrict `lcm_expand` within. Instead, `lcm_grep` returns enough context (matching messages with their summary annotations) for the agent to decide if it needs more detail, and it can grep again with a narrower pattern.
+```rust
+pub struct LcmGrepTool {
+    sqlite: Arc<SqliteMemory>,
+}
+```
 
-**Deliverable:** The agent can do forensic regex search over its full verbatim history. "What did I say about the deployment on Tuesday?" becomes answerable even after compaction.
+Tool parameters:
+- `pattern: String` — regex pattern (validated via `regex::Regex::new()` before executing; error returned to LLM if invalid)
+- `session_id: Option<String>` — filter to one session
+- `limit: usize` — default 20, max 50
+
+Results format each match as:
+```
+[{created_at}] {role}: {content}
+(covered by summary {summary_id} | active)
+```
+
+**Regexp registration:** The `regexp(pattern, value)` SQLite user-defined function must be registered on the connection in `SqliteMemory::open_connection()`, not at call time. Add via `conn.create_scalar_function("regexp", 2, ...)` using the `regex` crate. This makes `content REGEXP ?` work in the `search_messages()` query.
+
+Implementation in `search_messages()`:
+```sql
+SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+       ss.summary_id
+FROM messages m
+LEFT JOIN summary_sources ss ON ss.source_id = m.id AND ss.source_kind = 'message'
+WHERE m.content REGEXP ?
+  AND (? IS NULL OR m.session_id = ?)
+ORDER BY m.created_at DESC
+LIMIT ?
+```
+
+If `summary_id` is NULL in the result, display "active" (message has not been compacted).
+
+#### Verification
+
+```rust
+// crates/zeroclaw-memory/src/sqlite.rs — tests
+
+#[test]
+fn lcm_grep_basic_match() {
+    // insert message with content "hello world"; grep "hello" returns it
+}
+
+#[test]
+fn lcm_grep_session_filter() {
+    // two sessions; grep with session_id filter returns only matching session
+}
+
+#[test]
+fn lcm_grep_invalid_regex_returns_error() {
+    // pattern "[unclosed" → anyhow::Error, not panic
+}
+
+#[test]
+fn lcm_grep_respects_limit() {
+    // insert 30 matching messages; grep with limit=5 returns exactly 5
+}
+
+#[test]
+fn lcm_grep_summary_annotation() {
+    // compress a message (Phase 2); grep for it; result includes summary_id, not "active"
+}
+
+#[test]
+fn regexp_function_registered_on_connection() {
+    // open SqliteMemory; execute "SELECT regexp('abc', 'xabcx')" returns 1
+}
+
+// crates/zeroclaw-tools/src/ — tool integration test
+
+#[tokio::test]
+async fn lcm_grep_tool_returns_formatted_results() {
+    // call tool with known pattern; verify result format includes timestamp, role, summary annotation
+}
+```
+
+**Deliverable:** The agent can do forensic regex search over its full verbatim history. Results are annotated with whether the message has been compacted.
 
 ---
 
 ### Phase 6: Dream Cycle
 
-**Files:** New cron job registration, `consolidation.rs` extension
+**Files:** New cron job registration, `crates/zeroclaw-memory/src/consolidation.rs` extension
 
-**What:**
-- Add `synthesize_stale_entities()` function to `consolidation.rs`
-- Register automatic cron job (default `0 3 * * *`) when memory backend is sqlite
-- Job logic:
-  1. Query stale entity nodes (synthesis_at IS NULL OR < updated_at)
-  2. For each (capped at 20/run): load events → LLM synthesis → update node
-  3. Embed synthesis text for vector search
-- Config: `dream_cycle_enabled`, `dream_cycle_cron`, `dream_cycle_max_per_run`, `synthesis_max_words`
+#### What to build
 
-**Deliverable:** Entity knowledge stays current without manual curation. After a few days of use, entity nodes contain rich, accurate summaries.
+New function in `consolidation.rs`:
+
+```rust
+pub async fn synthesize_stale_entities(
+    provider: &dyn Provider,
+    model: &str,
+    knowledge: &KnowledgeGraph,
+    embedder: &dyn EmbeddingProvider,
+    max_per_run: usize,
+) -> anyhow::Result<SynthesisReport>
+
+pub struct SynthesisReport {
+    pub nodes_processed: usize,
+    pub nodes_remaining: usize,  // stale nodes not processed due to cap
+}
+```
+
+Implementation:
+1. `knowledge.list_stale_nodes(effective_cap)` where `effective_cap` is computed as:
+   - Count total stale nodes
+   - If `total_stale > 5 * max_per_run`, use `5 * max_per_run` on this run (first-run catch-up)
+   - Otherwise use `max_per_run`
+   - Log a warning if first-run cap is in effect
+2. For each node:
+   - Load all `node_events` chronologically (no limit — these are small rows)
+   - Build synthesis prompt: `"Synthesize everything known about {title} ({node_type}). Preserve all facts and dates.\n\nEvents:\n{events}"`
+   - LLM call → synthesis text
+   - Embed synthesis text via `embedder`
+   - `knowledge.update_synthesis(node_id, synthesis, Some(&embedding))`
+3. Return `SynthesisReport`
+
+**Cron registration:** Register a `JobType::Agent` cron job (or equivalent) using the existing cron infrastructure, default schedule `0 3 * * *` (3am nightly). The job calls `synthesize_stale_entities()`. Gated by config:
+
+```toml
+[memory]
+dream_cycle_enabled = true       # default true when backend = sqlite
+dream_cycle_cron = "0 3 * * *"
+dream_cycle_max_per_run = 20
+dream_cycle_synthesis_max_tokens = 300   # synthesis is a concise paragraph, not a transcript
+```
+
+The 300-token default keeps synthesis calls cheap and output scannable. An entity with 50 accumulated events should still produce a short summary — the prompt should say "concise paragraph, at most a few sentences per major fact." Raise only if synthesis quality is empirically poor.
+
+#### Verification
+
+```rust
+// crates/zeroclaw-memory/src/consolidation.rs — tests
+
+#[tokio::test]
+async fn synthesize_stale_updates_synthesis_at() {
+    // create stale node (synthesis_at=NULL); run synthesize_stale_entities
+    // verify synthesis_at IS NOT NULL afterward
+}
+
+#[tokio::test]
+async fn synthesize_stale_updates_embedding() {
+    // after synthesis, nodes.embedding IS NOT NULL
+}
+
+#[tokio::test]
+async fn synthesize_respects_cap() {
+    // create 5 stale nodes; max_per_run=3; verify 3 processed, 2 remain
+    // report.nodes_remaining = 2
+}
+
+#[tokio::test]
+async fn first_run_cap_is_5x() {
+    // create 200 stale nodes; max_per_run=20
+    // verify effective_cap = 100 (5 × 20); report.nodes_processed = 100
+}
+
+#[tokio::test]
+async fn synthesis_uses_all_events() {
+    // node with 5 events; verify all 5 appear in the LLM prompt (check mock provider input)
+}
+
+#[tokio::test]
+async fn already_fresh_nodes_skipped() {
+    // node with synthesis_at set and no new events (updated_at < synthesis_at)
+    // verify not returned by list_stale_nodes
+}
+
+#[tokio::test]
+async fn dream_cycle_report_reflects_reality() {
+    // 15 stale nodes, max_per_run=20; all processed; nodes_remaining=0
+}
+```
+
+**Deliverable:** Entity knowledge stays current without manual curation. Embeddings on nodes enable vector search in Phase 4's RRF path. First-run backlog is handled within one night.
 
 ---
 
 ### Phase 7: Hygiene Reconciliation
 
-**Files:** `hygiene.rs`
+**Files:** `crates/zeroclaw-memory/src/hygiene.rs`
 
-**What — align existing hygiene with the new storage model:**
+#### What to build
 
-- **`prune_conversation_rows`**: With auto-save removed (Phase 1), no new Conversation rows are created. This pruner becomes a legacy cleanup — it can drain remaining old Conversation rows and then become a no-op. No change needed; it naturally winds down.
-- **`purge_session_archives`**: Session JSONL archives are still deletable — the `messages` table is now the authoritative searchable history, so archived JSONLs are redundant. No change needed.
-- **`messages` table**: The hygiene job must **never delete from `messages`**. This is the immutable store. The lossless guarantee depends on it.
-- **`summaries` table**: Never deleted. Summaries are small relative to raw messages.
-- **`node_events` table**: Never deleted. Entity event timelines are the input to dream cycle synthesis.
+**Rules (non-negotiable):**
+- `messages` table: **never delete any row**
+- `summaries` table: **never delete any row**
+- `summary_sources` table: **never delete any row**
+- `node_events` table: **never delete any row**
 
-**What — new: FTS index maintenance:**
+**`prune_conversation_rows`:** With auto-save removed (Phase 1), no new `Conversation` category rows are created. This function can remain as a legacy drain — it removes pre-existing `Conversation` rows older than `conversation_retention_days`. Once those drain out (30 days after Phase 1 ships), it becomes a no-op permanently. No code change needed.
 
-- After legacy Conversation rows are pruned, their `memories_fts` entries become orphaned. Add a periodic `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` to the hygiene job to keep the FTS index consistent.
+**FTS index maintenance:** Replace the periodic `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` with `VALUES('optimize')`. FTS5 `optimize` merges btree segments without a full rewrite — O(log n) amortized vs O(n) for rebuild. Reserve `rebuild` only when `pragma integrity_check` fails.
 
-**What — storage growth on `messages`:**
+```rust
+fn optimize_fts_indexes(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "INSERT INTO memories_fts(memories_fts) VALUES('optimize');
+         INSERT INTO messages_fts(messages_fts) VALUES('optimize');
+         INSERT INTO summaries_fts(summaries_fts) VALUES('optimize');",
+    )?;
+    Ok(())
+}
+```
 
-The `messages` table grows unboundedly. For a personal assistant running 24/7 across 30+ channels, this could reach hundreds of MB per year. Options for future work (not this proposal):
-- (a) Drop the FTS index on messages older than N days (keep rows, remove from `messages_fts`). Saves index size; `lcm_grep` falls back to slower `LIKE` for old messages.
-- (b) Move old message content to a `messages_archive` table (keep id/session_id/summary_id/created_at stub in `messages` for DAG integrity). `lcm_grep` gains `include_archived` flag.
-- (c) Do nothing. SQLite handles hundreds of MB fine. Revisit when it's actually a problem.
+This runs at the end of the 12-hour hygiene cycle. The new FTS tables (`messages_fts`, `summaries_fts`) are included from the first Phase 7 deploy.
 
-Leaning toward (c) for now. Hundreds of MB is not a problem for SQLite on modern hardware. This can be revisited if real-world usage shows otherwise.
+**Add hygiene reporting fields:**
+```rust
+struct HygieneReport {
+    // existing fields...
+    fts_optimized: bool,  // new
+}
+```
 
-**What — decay:**
+#### Verification
 
-Time decay (`decay.rs`) still applies to non-Core entries at recall time. With auto-save removed, the Conversation category effectively goes dormant. Decay continues to apply to:
-- Daily entries from consolidation (session summaries) — correct, older summaries should rank lower
-- Daily entries from the context compressor — correct, same reason
-- Core entries — exempt, as before
+```rust
+// crates/zeroclaw-memory/src/hygiene.rs — tests
 
-No changes needed to the decay system.
+#[test]
+fn hygiene_never_deletes_from_messages() {
+    // populate messages table; run full hygiene cycle; verify row count unchanged
+}
 
-**Deliverable:** Hygiene is consistent with the immutable store guarantee. No new deletion paths. Legacy cleanup winds down naturally.
+#[test]
+fn hygiene_never_deletes_from_summaries() {
+    // same for summaries table
+}
+
+#[test]
+fn fts_optimize_runs_on_all_tables() {
+    // run hygiene; verify 'optimize' was issued on memories_fts, messages_fts, summaries_fts
+    // (check via sqlite_master integrity or mock the connection)
+}
+
+#[test]
+fn conversation_row_pruning_is_noop_when_empty() {
+    // no Conversation rows; prune_conversation_rows returns 0
+}
+
+#[test]
+fn conversation_row_pruning_removes_old_rows() {
+    // insert Conversation rows with created_at = 40 days ago; prune; verify removed
+}
+```
+
+**Deliverable:** Hygiene is consistent with the immutable store guarantee. FTS indexes stay healthy without expensive full rebuilds. Legacy Conversation rows drain out naturally.
 
 ---
 
@@ -626,42 +1439,503 @@ No changes needed to the decay system.
 | Merging `knowledge.db` into `brain.db` | Different write patterns, no real need for cross-DB FKs, high migration risk for low benefit |
 | `lcm_expand` tool | Swarm agents are stateless; sub-agent restriction doesn't apply to our architecture |
 | Entity routing via key prefix (`people/alice` → memory_store) | Fragile convention; explicit `knowledge` tool calls are cleaner |
-| `UnifiedMemory` as a new backend | Evolve `SqliteMemory` directly; don't create a parallel backend |
+| `UnifiedMemory` as a new backend | Evolve `SqliteMemory` and `RetrievalPipeline` directly |
 | `llm_map` / `agentic_map` operators | Orthogonal to memory; separate project |
 | Scope-reduction invariant | Requires swarm redesign; separate project |
 | MCP server deployment | Local-first by design |
 | New `MemoryBackendKind::Unified` | One backend (sqlite), evolved. No migration decision for users. |
+| Backward-compat compressor Daily write | Clean cut, new deployment, no shims |
+| BM25-based entity dedup | Wrong tool for short normalized strings; exact slug + cosine is correct |
 
 ---
 
 ## 8. Open Questions
 
-**Q1: Message deduplication with session JSONL**
+**Q1: Message deduplication with session JSONL — resolved**
 
-The `messages` table and channel session JSONL files will contain overlapping data. Options:
-- (a) Accept the duplication. JSONL is the channel adapter's concern; `messages` table is the search index. Different purposes, acceptable redundancy.
-- (b) Replace JSONL session store with reads from `messages` table. This changes the `SessionBackend` trait and all channel adapters.
-
-Option (a) is much simpler and avoids a large refactor. The JSONL files are tiny relative to the SQLite data. Leaning toward (a).
+Accept the duplication. JSONL is the channel adapter's persistence concern; the `messages` table is the searchable index. Different purposes, acceptable redundancy. No channel adapter changes needed.
 
 **Q2: Entity detection — resolved**
 
-Consolidation is the primary entity creation path (see §5.6 and Phase 3). The consolidation prompt extracts entity mentions automatically. The explicit `knowledge` tool exists for manual creation and correction. This is option (c) from the original proposal — hybrid automatic + manual — which is the right answer now that consolidation owns entity extraction.
+Consolidation is the primary entity creation path (§5.6 and Phase 3). The consolidation prompt extracts entity mentions automatically via a dedicated second LLM call. The explicit `knowledge` tool exists for manual creation and correction.
 
-**Q3: RRF constant k=60**
+**Q3: RRF constant k=60 — resolved**
 
-Standard default from the original paper. Probably fine as a fixed constant. If we want to tune it later, it's a single constant in one function. Not worth making configurable now.
+Standard default from the original paper. Fixed constant in `rrf_merge()`. Not configurable for now.
 
-**Q4: How to thread source_message_id to node_events**
+**Q4: How to thread source_message_id to node_events — resolved**
 
-When the agent calls the `knowledge` tool during a conversation turn, we need to link the resulting `node_events` row back to the `messages` row. The tool execution context (`execute_one_tool`) doesn't carry session state.
+When `consolidate_turn()` fires (post-turn), the message IDs for that turn were assigned before appending to the history Vec (Phase 1 design). Pass the last user message ID and last assistant message ID as optional parameters to `consolidate_turn()`. For tool-sourced `knowledge` calls (where message ID is unavailable in the tool execution context), use `None` and rely on timestamp correlation.
 
-Options:
-- (a) Thread a "current message ID" through the tool execution context. Requires adding a parameter to the tool execution path.
-- (b) Use a task-local (tokio) to carry the current message ID. Set it in the agent loop before tool execution.
-- (c) Accept NULL for `source_message_id` when called from tools. The temporal correlation (matching timestamps) is good enough for most uses.
+**Q5: brain.db foreign key enforcement**
 
-Leaning toward (b) for cleanliness, with (c) as fallback.
+brain.db currently does not enable `PRAGMA foreign_keys = ON` (knowledge.db does). Add it to the PRAGMA block in `SqliteMemory::open_connection()`. The existing `memories` table has no FK columns so this is safe. The new `summaries_sources` table benefits from it for cascade delete on `summaries`.
+
+**Q6: Storage growth on `messages` table**
+
+The `messages` table grows unboundedly. For a personal assistant running 24/7 across 30+ channels, this could reach hundreds of MB per year. Options deferred to post-launch:
+- (a) Drop FTS index on messages older than N days (keep rows for DAG integrity; `lcm_grep` falls back to LIKE for old messages)
+- (b) Move old message content to `messages_archive` (keep stub in `messages` for DAG)
+- (c) Do nothing. SQLite handles hundreds of MB fine.
+
+Leaning toward (c) until it's actually a problem.
+
+---
+
+## 9. Integration Test Suite
+
+**File:** `tests/integration/memory_pipeline.rs`  
+**Registration:** Add `mod memory_pipeline;` to `tests/integration/mod.rs`
+
+This phase adds no production code — only tests. The goal is to verify nonlocal properties: correct behavior when all phases are running together, correct data flow across module boundaries, and correct output quality of the full retrieval pipeline. Individual unit tests verify that each function does the right thing in isolation; these tests verify that the system as a whole does the right thing.
+
+---
+
+### 9.1 Test Infrastructure
+
+#### `AxisEmbedder` — Deterministic Embedder for Vector Tests
+
+The `NoopEmbedding` backend returns no embeddings, making cosine tests impossible. Real embedding providers hit external APIs. `AxisEmbedder` is a deterministic in-process embedder that assigns each text a unit vector along a single principal axis, chosen by a keyword in the content. Two texts with the same keyword have cosine similarity 1.0; two texts with different keywords have cosine similarity 0.0. This makes vector search completely predictable.
+
+```rust
+/// Test-only embedding provider. Maps content to a principal axis based on
+/// the first recognized keyword. Used to make vector recall tests deterministic.
+///
+/// Keyword → axis mapping is configured at construction time, e.g.:
+///   [("alice", 0), ("acme", 1), ("deployment", 2), ("weather", 3)]
+///
+/// Content not matching any keyword → zero vector (never retrieved by cosine search).
+pub struct AxisEmbedder {
+    dims: usize,
+    mappings: Vec<(&'static str, usize)>,  // (keyword, axis_index)
+}
+
+impl AxisEmbedder {
+    pub fn new(dims: usize, mappings: Vec<(&'static str, usize)>) -> Self
+
+    fn axis_for(&self, text: &str) -> Option<usize> {
+        let lower = text.to_lowercase();
+        self.mappings.iter()
+            .find(|(kw, _)| lower.contains(kw))
+            .map(|(_, ax)| *ax)
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for AxisEmbedder {
+    fn dims(&self) -> usize { self.dims }
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        texts.iter().map(|t| {
+            let mut v = vec![0.0f32; self.dims];
+            if let Some(ax) = self.axis_for(t) { v[ax] = 1.0; }
+            Ok(v)
+        }).collect()
+    }
+}
+```
+
+Standard axis map used across most tests:
+```rust
+fn standard_axes() -> Vec<(&'static str, usize)> {
+    vec![
+        ("alice",      0),
+        ("acme",       1),
+        ("deployment", 2),
+        ("weather",    3),
+        ("consensus",  4),
+        ("deadline",   5),
+    ]
+}
+```
+
+#### `MemoryWorld` — Pre-loaded Test Fixture
+
+Rather than hand-building data in every test, `MemoryWorld` constructs a realistic fake corpus representing a personal assistant's accumulated memory. Tests that don't need custom data use `MemoryWorld::standard()`.
+
+```rust
+pub struct MemoryWorld {
+    pub tmp: TempDir,
+    pub brain: Arc<SqliteMemory>,
+    pub knowledge: Arc<KnowledgeGraph>,
+    pub pipeline: RetrievalPipeline,
+    pub session_a: String,  // "session-alice-project"
+    pub session_b: String,  // "session-new-topic"
+}
+
+impl MemoryWorld {
+    /// Build with AxisEmbedder + standard fake corpus loaded.
+    pub async fn standard() -> Self
+
+    /// Build with NoopEmbedding (BM25-only tests).
+    pub async fn keyword_only() -> Self
+
+    /// Build empty — no fake data loaded. For tests that control their own data.
+    pub async fn empty() -> Self
+}
+```
+
+**Standard corpus** (loaded in `MemoryWorld::standard()`):
+
+*Knowledge graph — 3 entity nodes:*
+```
+alice        | person  | "Alice Chen, lead engineer at Acme"
+acme         | company | "Acme Corp, enterprise software company"
+consensus_rewrite | project | "Distributed consensus rewrite project at Acme"
+```
+
+*Knowledge graph — 2 edges:*
+```
+alice → acme              | employed_by
+alice → consensus_rewrite | works_on
+```
+
+*Knowledge graph — node_events (3 per node):*
+```
+alice events:
+  "Met Alice at PyCon 2026-03-10. She is lead engineer at Acme."
+  "Alice confirmed deployment window is first week of May."
+  "Alice prefers async communication over meetings."
+
+acme events:
+  "Acme is pivoting to enterprise market as of Q1 2026."
+  "Acme uses Django backend, Vue.js frontend."
+  "Acme deployment infrastructure runs on AWS us-east-1."
+
+consensus_rewrite events:
+  "Consensus rewrite started 2026-02-01. Target: 10x throughput."
+  "PR #42 opened by alice for consensus rewrite phase 1."
+  "Consensus rewrite deployment scheduled for May 2026."
+```
+
+*memories table — 6 Core facts:*
+```
+user_timezone     | "EST (UTC-5)"
+project_stack     | "Django + SQLAlchemy backend, Vue.js frontend"
+user_language_pref| "Prefers Rust for systems code, Python for scripts"
+preferred_deploy  | "Blue-green deployment, no traffic cutover without staging"
+standup_time      | "Daily standup at 9am EST"
+git_workflow      | "Feature branches off main, PR required, squash merge"
+```
+
+*memories table — 3 Daily summaries:*
+```
+daily_2026-04-10_... | "Discussed deployment timeline with alice. PR #42 in review."
+daily_2026-04-11_... | "Reviewed consensus rewrite architecture. Alice flagged a race condition."
+daily_2026-04-12_... | "Standup: deployment target confirmed for May 5."
+```
+
+*messages table — 10 messages across 2 sessions:*
+
+Session A (5 messages — the alice/deployment conversation):
+```
+user      | "What's the status of the consensus rewrite?"
+assistant | "Based on my notes, alice has PR #42 open for phase 1..."
+user      | "When is deployment?"
+assistant | "Alice confirmed the deployment window is first week of May."
+user      | "Remind me of Alice's contact preferences."
+```
+
+Session B (5 messages — unrelated topic):
+```
+user      | "What's the weather like in New York?"
+assistant | "I don't have live weather data, but New York in April is mild..."
+user      | "What about flights?"
+assistant | "I'd need a travel tool to check flights."
+user      | "Never mind, let's talk about something else."
+```
+
+*summaries table — 1 leaf summary:* A compacted summary of the first 3 messages from Session A (simulating a past compression run), linked to those message IDs via `summary_sources`.
+
+---
+
+### 9.2 Test Scenarios
+
+#### Group 1: Cross-Component Data Flow
+
+These tests verify that data written by one phase is correctly read by another.
+
+---
+
+```rust
+#[tokio::test]
+async fn messages_written_and_searchable_via_fts()
+```
+Load `MemoryWorld::standard()`. Verify that FTS search for `"deployment"` on the `messages` table returns at least 2 results (the two Session A messages about deployment). Verify that each result has the correct `session_id` and `role` fields populated. This confirms the Phase 1 → Phase 5 data path.
+
+---
+
+```rust
+#[tokio::test]
+async fn summary_sources_link_covered_messages()
+```
+From `MemoryWorld::standard()`, query `summary_sources` for the pre-loaded leaf summary. Verify it links to exactly 3 message IDs (the first 3 Session A messages). Verify `source_kind = 'message'` for all entries. This confirms the Phase 2 DAG integrity.
+
+---
+
+```rust
+#[tokio::test]
+async fn compressed_message_still_findable_via_summary_recall()
+```
+Using `MemoryWorld::standard()`, call `pipeline.recall("consensus rewrite deployment", 5)`. Verify that the result set contains the pre-loaded leaf summary (which covers the compacted messages about consensus and deployment). Verify that the raw messages it covered are *not* in the top results (they are superseded by the summary). This confirms the Phase 2 → Phase 4 data path.
+
+---
+
+```rust
+#[tokio::test]
+async fn lcm_grep_annotates_compacted_messages_with_summary_id()
+```
+From `MemoryWorld::standard()`, call `brain.search_messages("consensus", None, 10)`. For results that are covered by the pre-loaded summary, verify `summary_id` is `Some(...)`. For active (non-compacted) messages, verify `summary_id` is `None`. This confirms the Phase 1 + Phase 2 → Phase 5 data path.
+
+---
+
+```rust
+#[tokio::test]
+async fn entity_events_written_and_queryable()
+```
+Load `MemoryWorld::empty()`. Create entity node "alice" and append 3 events. Call `knowledge.get_with_timeline("alice_id", 10)`. Verify node is returned, timeline has 3 events in chronological order, and contents match what was written. This confirms the Phase 3 internal data path.
+
+---
+
+```rust
+#[tokio::test]
+async fn consolidation_creates_entity_in_knowledge_graph()
+```
+Load `MemoryWorld::empty()`. Use `RecordingProvider` scripted to return:
+- Call 1 (history summary): `{"history_entry": "Discussed Alice at Acme.", "memory_update": null}`
+- Call 2 (entity extraction): `{"entities": [{"type": "person", "slug": "alice", "fact": "Lead engineer at Acme."}], "relations": []}`
+
+Call `consolidate_turn(provider, model, memory, Some(&knowledge), user_msg, assistant_msg)`. Verify:
+1. A node with title `"alice"` exists in knowledge.db
+2. A `node_events` row exists with content containing `"Lead engineer at Acme"`
+3. The node's `synthesis_at` is NULL (marked stale by the trigger)
+4. Exactly 2 LLM calls were made (verified via `RecordingProvider`)
+
+---
+
+```rust
+#[tokio::test]
+async fn consolidation_creates_relation_between_entities()
+```
+Pre-populate knowledge graph with nodes "alice" and "acme". Script `RecordingProvider` entity extraction response to return a relation `{"from": "alice", "to": "acme", "relation": "employed_by"}`. Run `consolidate_turn()`. Verify an edge exists in the `edges` table with normalized relation `"employed_by"`.
+
+---
+
+```rust
+#[tokio::test]
+async fn dream_cycle_synthesis_enables_vector_recall()
+```
+Load `MemoryWorld::empty()` with `AxisEmbedder` (standard axes). Create entity node "alice" with 3 events containing the word "alice". Run `synthesize_stale_entities()` with a mock provider returning `"Alice Chen, lead engineer at Acme."` as the synthesis. Verify:
+1. `nodes.synthesis` is set
+2. `nodes.embedding` is a non-empty BLOB (axis 0 = 1.0, all others 0.0)
+3. `knowledge.search("alice contact preferences", 5)` returns the node via cosine path (axis 0 matches)
+
+This confirms the Phase 6 → Phase 4 vector search data path.
+
+---
+
+#### Group 2: Retrieval and Ranking Correctness
+
+These tests verify that the recall pipeline returns the right things in the right order.
+
+---
+
+```rust
+#[tokio::test]
+async fn rrf_item_in_two_sources_outranks_item_in_one_source()
+```
+Load `MemoryWorld::empty()`. Store the same fact as both a Core memory entry and as a node event on an entity. Store a different fact as only a Core memory entry. Run `pipeline.recall("fact content", 10)`. Verify the item present in both sources has a higher `rrf_score` than the item present in only one source.
+
+This directly validates the RRF multi-source advantage.
+
+---
+
+```rust
+#[tokio::test]
+async fn recall_top_result_is_most_relevant()
+```
+Load `MemoryWorld::standard()`. Call `pipeline.recall("alice deployment window", 10)`. Verify:
+1. At least one result contains the word "alice" or "deployment"
+2. The top-ranked result is more relevant than the 5th-ranked result (higher score or better content match)
+3. The weather/flight Session B messages are not in the results
+
+This checks that BM25 is actually discriminating on content, not returning everything.
+
+---
+
+```rust
+#[tokio::test]
+async fn vector_recall_returns_entity_not_keyword_matched()
+```
+Load `MemoryWorld::empty()` with `AxisEmbedder`. Store a Core memory about "alice" (keyword matches query). Create a knowledge graph node "alice" and set its embedding to axis 0. Run `pipeline.recall("alice", 5)`. Verify both the Core memory and the knowledge node appear in results — confirming that vector path contributes entity results alongside keyword results.
+
+---
+
+```rust
+#[tokio::test]
+async fn session_b_messages_absent_from_session_a_recall()
+```
+Using `MemoryWorld::standard()`, call `pipeline.recall("weather new york", 10, session_id=Some("session-alice-project"))`. Verify that Session B messages about weather and flights do not appear. When called without `session_id`, verify they do appear.
+
+This tests session-scoped recall isolation — important so unrelated conversations don't pollute each other's context.
+
+---
+
+```rust
+#[tokio::test]
+async fn cross_session_entity_knowledge_available_everywhere()
+```
+Using `MemoryWorld::standard()`, call `pipeline.recall("alice", 10, session_id=Some("session-new-topic"))`. Verify the entity node for "alice" appears in results even though it was learned in Session A. Entity nodes are session-agnostic.
+
+This is the flip side of the previous test: facts about people should transcend session boundaries.
+
+---
+
+#### Group 3: Context Block Quality
+
+These tests verify the output of `build_context()` — the actual string injected into every LLM call.
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_emits_structured_sections()
+```
+Load `MemoryWorld::standard()`. Call `build_context(pipeline, "tell me about alice", 0.0, None)`. Verify:
+1. Output contains `[Context]` and `[/Context]` delimiters
+2. Output contains `## People` section (entity node for alice has `node_type = "person"`)
+3. Output contains `## Facts` section (Core memories)
+4. Entity sections appear before `## Facts`
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_omits_empty_sections()
+```
+Load `MemoryWorld::empty()`. Store only Core memories (no knowledge graph nodes). Call `build_context()`. Verify there is no `## People` section and no `## Companies` section. Sections with no content are not emitted.
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_omits_tool_result_content()
+```
+Load `MemoryWorld::empty()`. Store a Core memory whose content is a `<tool_result>` block (simulating a legacy stale entry). Call `build_context()`. Verify the tool_result content does not appear in the output. This is a regression guard for the existing `<tool_result` filter.
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_size_bounded_under_load()
+```
+Load `MemoryWorld::empty()`. Store 200 Core memory entries with varying content. Call `build_context()` with `limit=10`. Verify:
+1. The output string length is bounded (not proportional to 200 entries)
+2. At most 10 entries appear in the output
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_session_summary_in_history_section()
+```
+Load `MemoryWorld::standard()`. Call `build_context(pipeline, "deployment", 0.0, Some("session-alice-project"))`. Verify the output contains a `## Session history` section with content from the pre-loaded leaf summary. The summary covers earlier turns from the same session and should appear here.
+
+---
+
+```rust
+#[tokio::test]
+async fn build_context_entity_synthesis_used_when_available()
+```
+Load `MemoryWorld::empty()`. Create entity "alice" with 3 events and a synthesized `synthesis` field set to `"Alice Chen. Lead engineer at Acme. Prefers async comms."`. Call `build_context(pipeline, "alice", 0.0, None)`. Verify the synthesis text (not the raw events) appears in the context output. The structured context block should use the synthesis, not the raw event list.
+
+---
+
+#### Group 4: Hygiene Safety
+
+---
+
+```rust
+#[tokio::test]
+async fn hygiene_preserves_all_immutable_tables()
+```
+Load `MemoryWorld::standard()`. Record the row counts for `messages`, `summaries`, `summary_sources`, `node_events`. Run the full hygiene cycle (`hygiene::run_if_due()` with a forced run). Recount. Verify all four counts are identical to before. Verify the Conversation-category rows (if any) may decrease, but the immutable tables are untouched.
+
+---
+
+```rust
+#[tokio::test]
+async fn hygiene_fts_optimize_does_not_corrupt_search()
+```
+Load `MemoryWorld::standard()`. Run hygiene (which calls FTS optimize). Immediately call `pipeline.recall("alice", 5)` and `brain.search_messages("deployment", None, 10)`. Verify results are non-empty and consistent with what was stored before optimize ran. FTS optimize should not corrupt search results.
+
+---
+
+#### Group 5: End-to-End Pipeline
+
+```rust
+#[tokio::test]
+async fn full_pipeline_end_to_end()
+```
+
+This is the flagship test. It simulates a realistic multi-turn session from message receipt to context injection, covering all phases sequentially:
+
+1. **Setup:** Empty `MemoryWorld` with `AxisEmbedder` and `RecordingProvider`
+
+2. **Turn 1 — message storage (Phase 1):**  
+   Append user message `"Alice from Acme wants to discuss the consensus rewrite deployment"` and assistant response `"I'll set up a meeting with Alice to discuss the deployment timeline."` to `messages` table. Verify both rows exist.
+
+3. **Consolidation (Phase 3):**  
+   Run `consolidate_turn()` with entity extraction scripted to return alice (person) and acme (company) entities and an `employed_by` relation. Verify:
+   - alice and acme nodes created in knowledge.db
+   - node_events rows exist for both
+   - edge `alice → acme (employed_by)` exists
+   - synthesis_at IS NULL on both nodes (stale trigger fired)
+
+4. **Compression (Phase 2):**  
+   Add 20 more short messages to push past the soft threshold. Run `compress_if_needed()`. Verify:
+   - A leaf summary row exists in `summaries`
+   - `summary_sources` links the covered messages
+   - The history Vec now contains a `[SUMMARY:...]` placeholder
+   - No `compressed_context_*` entries in `memories` (old path removed)
+
+5. **Dream cycle (Phase 6):**  
+   Run `synthesize_stale_entities()` with mock provider returning synthesis text. Verify `nodes.synthesis` and `nodes.embedding` are set on alice and acme.
+
+6. **Unified recall (Phase 4):**  
+   Call `pipeline.recall("alice deployment", 10)`. Verify:
+   - Results include at least one entry from `memories` (Daily consolidation)
+   - Results include at least one knowledge node (alice or acme entity)
+   - Results include the leaf summary
+   - alice entity outranks the weather/unrelated entries (if any)
+
+7. **Context injection (Phase 4 + loop_.rs):**  
+   Call `build_context()` with query `"deployment meeting with alice"`. Verify:
+   - Output contains `[Context]` and `[/Context]`
+   - Output contains a `## People` section with alice
+   - Output contains `## Facts` section with user preferences
+   - Output contains `## Session history` section with the summary
+   - Output does NOT contain the raw tool_result content
+
+8. **lcm_grep (Phase 5):**  
+   Search for `"consensus rewrite"` in the messages table. Verify:
+   - Turn 1 user message is returned
+   - The covered messages (now summarized) include their `summary_id` annotation
+   - Active messages show `summary_id = None`
+
+9. **Hygiene (Phase 7):**  
+   Run hygiene. Verify all `messages`, `summaries`, `node_events` row counts are unchanged.
+
+Each step in this test is a checkpoint: if it fails, the failure message indicates exactly which phase's data path is broken.
+
+---
+
+### 9.3 Notes on Test Determinism
+
+- All tests use `TempDir` for isolated databases — no shared state between tests.
+- `AxisEmbedder` produces deterministic embeddings without network calls. Use it for any test that needs vector search to work.
+- `RecordingProvider` (from `tests/support/mock_provider.rs`) records every LLM call, allowing tests to verify both the outputs and the prompts that were sent.
+- Tests in Groups 1–4 are self-contained and can run in parallel. The `full_pipeline_end_to_end` test in Group 5 is sequential by design (each step depends on the previous).
+- Avoid `assert!(results.len() > 0)` — use exact counts where the corpus is controlled, so failures are immediately diagnosable.
 
 ---
 
