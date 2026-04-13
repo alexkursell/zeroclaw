@@ -18,6 +18,7 @@ struct HygieneReport {
     purged_memory_archives: u64,
     purged_session_archives: u64,
     pruned_conversation_rows: u64,
+    fts_optimized: bool,
 }
 
 impl HygieneReport {
@@ -55,6 +56,14 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         config.conversation_retention_days,
     );
 
+    let fts_optimized = match optimize_fts_indexes(workspace_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("fts optimize skipped: {e}");
+            false
+        }
+    };
+
     let report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
             workspace_dir,
@@ -64,6 +73,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
         pruned_conversation_rows: prune_conversation_rows(workspace_dir, conversation_retention)?,
+        fts_optimized,
     };
 
     // Prune audit entries if audit is enabled.
@@ -75,14 +85,15 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
 
     write_state(workspace_dir, &report)?;
 
-    if report.total_actions() > 0 {
+    if report.total_actions() > 0 || report.fts_optimized {
         tracing::info!(
-            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={}",
+            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={} fts_optimized={}",
             report.archived_memory_files,
             report.archived_session_files,
             report.purged_memory_archives,
             report.purged_session_archives,
             report.pruned_conversation_rows,
+            report.fts_optimized,
         );
     }
 
@@ -356,6 +367,22 @@ fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> 
     Ok(())
 }
 
+fn optimize_fts_indexes(workspace_dir: &Path) -> Result<()> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    conn.execute_batch(
+        "INSERT INTO memories_fts(memories_fts) VALUES('optimize');
+         INSERT INTO messages_fts(messages_fts) VALUES('optimize');
+         INSERT INTO summaries_fts(summaries_fts) VALUES('optimize');",
+    )?;
+    Ok(())
+}
+
 fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {
     let stem = filename.strip_suffix(".md")?;
     let date_part = stem.split('_').next().unwrap_or(stem);
@@ -540,6 +567,134 @@ mod tests {
 
         assert!(!old_file.exists(), "old archived file should be purged");
         assert!(keep_file.exists(), "recent archived file should remain");
+    }
+
+    #[test]
+    fn hygiene_never_deletes_from_messages_table() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        mem.append_message(&msg_id, "s1", "user", "hello world", None).unwrap();
+        drop(mem);
+
+        // Back-date the message row to simulate an old entry.
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(90)).to_rfc3339();
+        conn.execute(
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            params![old_cutoff, msg_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = default_cfg();
+        cfg.conversation_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        // Message must still be present — hygiene never deletes from messages.
+        let conn2 = Connection::open(&db_path).unwrap();
+        let count: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM messages WHERE id = ?1", params![msg_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "hygiene must never delete rows from the messages table");
+    }
+
+    #[test]
+    fn hygiene_never_deletes_from_summaries_table() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        let summary_id = uuid::Uuid::new_v4().to_string();
+        mem.insert_summary(&summary_id, "condensed", "some summary text", None, "s1", 1)
+            .unwrap();
+        drop(mem);
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(90)).to_rfc3339();
+        conn.execute(
+            "UPDATE summaries SET created_at = ?1 WHERE id = ?2",
+            params![old_cutoff, summary_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = default_cfg();
+        cfg.conversation_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let conn2 = Connection::open(&db_path).unwrap();
+        let count: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM summaries WHERE id = ?1",
+                params![summary_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "hygiene must never delete rows from the summaries table");
+    }
+
+    #[test]
+    fn fts_optimize_runs_on_all_three_tables() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        // Initialize the DB (creates FTS tables).
+        let mem = SqliteMemory::new(workspace).unwrap();
+        mem.append_message(&uuid::Uuid::new_v4().to_string(), "s1", "user", "content to index", None)
+            .unwrap();
+        drop(mem);
+
+        // optimize_fts_indexes should succeed without error.
+        optimize_fts_indexes(workspace).unwrap();
+
+        // Running a second time is idempotent.
+        optimize_fts_indexes(workspace).unwrap();
+    }
+
+    #[test]
+    fn fts_optimize_sets_report_field() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        drop(mem); // Just need the schema to exist.
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        run_if_due(&cfg, workspace).unwrap();
+
+        // Read back the persisted state and check fts_optimized was recorded.
+        let state_raw = fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap();
+        let state: HygieneState = serde_json::from_str(&state_raw).unwrap();
+        assert!(state.last_report.fts_optimized, "fts_optimized should be true in state file");
+    }
+
+    #[test]
+    fn conversation_row_pruning_is_noop_when_empty() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        // DB initialized but no conversation rows.
+        let mem = SqliteMemory::new(workspace).unwrap();
+        drop(mem);
+
+        let mut cfg = default_cfg();
+        cfg.conversation_retention_days = 7;
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let state_raw = fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap();
+        let state: HygieneState = serde_json::from_str(&state_raw).unwrap();
+        assert_eq!(state.last_report.pruned_conversation_rows, 0);
     }
 
     #[tokio::test]

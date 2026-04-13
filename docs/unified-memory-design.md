@@ -1674,6 +1674,14 @@ fn conversation_row_pruning_removes_old_rows() {
 
 **Deliverable:** Hygiene is consistent with the immutable store guarantee. FTS indexes stay healthy without expensive full rebuilds. Legacy Conversation rows drain out naturally.
 
+#### Implementation notes
+
+`optimize_fts_indexes(workspace_dir: &Path)` opens `brain.db` directly (same pattern as `prune_conversation_rows`), sets WAL mode, then runs `execute_batch` with all three `optimize` commands. Called at the top of the report-building block in `run_if_due()`, before constructing `HygieneReport` — result stored in `fts_optimized: bool` and folded into the struct literal. Errors are logged at debug level and set `fts_optimized = false` (best-effort, same policy as audit pruning). `total_actions()` left unchanged — it counts file/row mutations; `fts_optimized` is a maintenance flag, not a mutation count. Tracing log extended with `fts_optimized={}` and the condition widened to `total_actions() > 0 || fts_optimized`. `HygieneState` persists `fts_optimized` to JSON via `#[derive(Serialize, Deserialize)]` on `HygieneReport`.
+
+Five new tests added — all `#[test]` (sync; `SqliteMemory::new`, `append_message`, `insert_summary` are all non-async): `hygiene_never_deletes_from_messages_table`, `hygiene_never_deletes_from_summaries_table`, `fts_optimize_runs_on_all_three_tables` (calls `optimize_fts_indexes` twice — idempotent), `fts_optimize_sets_report_field` (reads state JSON, asserts `fts_optimized = true`), `conversation_row_pruning_is_noop_when_empty`. All 10 hygiene tests pass.
+
+**Results:** 10 hygiene tests pass. 0 failures.
+
 ---
 
 ## 7. What Gets Cut
