@@ -478,6 +478,10 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         audit_retention_days: 30,
         policy: zeroclaw_config::schema::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
+        dream_cycle_enabled: profile.uses_sqlite_hygiene,
+        dream_cycle_cron: "0 3 * * *".into(),
+        dream_cycle_max_per_run: 20,
+        dream_cycle_synthesis_max_tokens: 300,
         qdrant: zeroclaw_config::schema::QdrantConfig::default(),
     }
 }

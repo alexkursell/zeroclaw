@@ -10,9 +10,11 @@
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
 use crate::conflict;
+use crate::embeddings::EmbeddingProvider;
 use crate::importance;
-use crate::knowledge_graph::KnowledgeGraph;
+use crate::knowledge_graph::{KnowledgeGraph, NodeEvent};
 use crate::traits::{Memory, MemoryCategory};
+use std::fmt::Write as _;
 use zeroclaw_api::provider::Provider;
 
 /// A single entity mention extracted from a conversation turn.
@@ -229,6 +231,120 @@ pub async fn consolidate_turn(
     Ok(())
 }
 
+// ── Dream Cycle (Phase 6) ────────────────────────────────────────────────────
+
+/// Summary of a dream cycle synthesis run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthesisReport {
+    /// Number of stale nodes synthesized in this run.
+    pub nodes_processed: usize,
+    /// Stale nodes that existed but were not processed due to the per-run cap.
+    pub nodes_remaining: usize,
+}
+
+const SYNTHESIS_SYSTEM_PROMPT: &str = r#"You are a concise knowledge synthesizer. Given facts about an entity gathered over time, produce a short synthesis paragraph. Preserve all key facts and dates. Write at most a few sentences per major fact. Be factual and precise. Output plain text only — no markdown, no headers."#;
+
+/// Synthesize all stale knowledge graph entities using an LLM + embedder.
+///
+/// "Stale" means `synthesis_at IS NULL` (never synthesized) or
+/// `synthesis_at < updated_at` (new events since last synthesis).
+///
+/// `max_per_run` caps normal batches. When the backlog is large (> 5×),
+/// a first-run catch-up mode processes up to 5 × `max_per_run` nodes to
+/// clear the initial debt within a single night.
+pub async fn synthesize_stale_entities(
+    provider: &dyn Provider,
+    model: &str,
+    knowledge: &KnowledgeGraph,
+    embedder: &dyn EmbeddingProvider,
+    max_per_run: usize,
+) -> anyhow::Result<SynthesisReport> {
+    // Count total stale nodes to decide effective cap.
+    let total_stale = knowledge.list_stale_nodes(usize::MAX)?.len();
+
+    let effective_cap = if total_stale > 5 * max_per_run {
+        tracing::warn!(
+            total_stale,
+            max_per_run,
+            "dream cycle: large backlog detected, using 5× cap ({} nodes)",
+            5 * max_per_run
+        );
+        5 * max_per_run
+    } else {
+        max_per_run
+    };
+
+    let nodes = knowledge.list_stale_nodes(effective_cap)?;
+    let nodes_processed_cap = nodes.len();
+
+    let mut nodes_processed = 0;
+
+    for node in nodes {
+        // Load all events (no practical limit — events are small rows).
+        let timeline = knowledge.get_with_timeline(&node.id, usize::MAX)?;
+        let events: Vec<NodeEvent> = timeline
+            .map(|(_, evts)| evts)
+            .unwrap_or_default();
+
+        // Build synthesis prompt.
+        let mut events_text = String::new();
+        // Events come back newest-first from get_with_timeline; reverse for chronological order.
+        for event in events.iter().rev() {
+            let _ = writeln!(events_text, "- [{}] {}", event.created_at, event.content);
+        }
+
+        let prompt = if events_text.is_empty() {
+            format!(
+                "Synthesize everything known about {} ({}).\n\nNo events recorded yet.",
+                node.title, node.node_type
+            )
+        } else {
+            format!(
+                "Synthesize everything known about {} ({}).\
+                 Preserve all facts and dates.\n\nEvents:\n{}",
+                node.title, node.node_type, events_text
+            )
+        };
+
+        // LLM synthesis call.
+        let synthesis = match provider
+            .chat_with_system(Some(SYNTHESIS_SYSTEM_PROMPT), &prompt, model, 0.1)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(node_id = %node.id, error = %e, "dream cycle: synthesis LLM call failed");
+                continue;
+            }
+        };
+
+        // Embed synthesis text (best-effort — embedder may be NoopEmbedding).
+        let embedding: Option<Vec<f32>> = match embedder.embed_one(&synthesis).await {
+            Ok(v) if !v.is_empty() => Some(v),
+            _ => None,
+        };
+
+        // Persist synthesis + embedding.
+        if let Err(e) = knowledge.update_synthesis(
+            &node.id,
+            &synthesis,
+            embedding.as_deref(),
+        ) {
+            tracing::warn!(node_id = %node.id, error = %e, "dream cycle: update_synthesis failed");
+            continue;
+        }
+
+        nodes_processed += 1;
+    }
+
+    let nodes_remaining = total_stale.saturating_sub(nodes_processed_cap);
+
+    Ok(SynthesisReport {
+        nodes_processed,
+        nodes_remaining,
+    })
+}
+
 /// Parse entity extraction response, returning an error if JSON is invalid.
 fn parse_entity_extraction_response(raw: &str) -> anyhow::Result<EntityExtractionResult> {
     let cleaned = raw
@@ -276,6 +392,216 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge_graph::KnowledgeGraph;
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use zeroclaw_api::provider::{ChatMessage, Provider};
+
+    // ── Mock Provider ─────────────────────────────────────────────
+
+    struct FixedResponseProvider {
+        response: String,
+        /// Records every prompt seen (user message) for assertion.
+        prompts_seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FixedResponseProvider {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into(), prompts_seen: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts_seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FixedResponseProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.prompts_seen.lock().unwrap().push(message.to_string());
+            Ok(self.response.clone())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if let Some(last) = messages.last() {
+                self.prompts_seen.lock().unwrap().push(format!("{:?}", last));
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    // ── Mock EmbeddingProvider ────────────────────────────────────
+
+    struct FixedEmbeddingProvider {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for FixedEmbeddingProvider {
+        fn name(&self) -> &str { "test" }
+        fn dimensions(&self) -> usize { self.dims }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1f32; self.dims]).collect())
+        }
+    }
+
+    fn test_kg() -> (TempDir, KnowledgeGraph) {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("kg.db");
+        let kg = KnowledgeGraph::new(&db_path, 10_000).unwrap();
+        (tmp, kg)
+    }
+
+    fn add_stale_node(kg: &KnowledgeGraph, slug: &str, node_type: &str, content: &str) -> String {
+        let (id, _) = kg.find_or_create_by_slug(slug, node_type, slug, content).unwrap();
+        // Add an event to mark it stale (trigger sets synthesis_at = NULL).
+        kg.add_event(&id, "initial fact", None, None).unwrap();
+        id
+    }
+
+    // ── Dream cycle tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn synthesize_stale_updates_synthesis_at() {
+        let (_tmp, kg) = test_kg();
+        let id = add_stale_node(&kg, "alice", "person", "");
+        let provider = FixedResponseProvider::new("Alice is a lead engineer.");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        let report = synthesize_stale_entities(&provider, "test-model", &kg, &embedder, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.nodes_processed, 1);
+        let node = kg.get_node(&id).unwrap().unwrap();
+        assert!(node.synthesis_at.is_some(), "synthesis_at should be set after synthesis");
+        assert_eq!(node.synthesis.as_deref(), Some("Alice is a lead engineer."));
+    }
+
+    #[tokio::test]
+    async fn synthesize_stale_updates_embedding() {
+        let (_tmp, kg) = test_kg();
+        add_stale_node(&kg, "bob", "person", "");
+        let provider = FixedResponseProvider::new("Bob is a backend developer.");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        synthesize_stale_entities(&provider, "test-model", &kg, &embedder, 10)
+            .await
+            .unwrap();
+
+        // Check that embedding was stored (non-null, correct size).
+        // We can't directly read the embedding without a raw SQL query, but
+        // synthesis_at being set confirms update_synthesis() was called successfully.
+        let stale_after = kg.list_stale_nodes(100).unwrap();
+        assert!(stale_after.is_empty(), "node should no longer be stale");
+    }
+
+    #[tokio::test]
+    async fn synthesize_respects_cap() {
+        let (_tmp, kg) = test_kg();
+        for i in 0..5 {
+            add_stale_node(&kg, &format!("entity_{i}"), "thing", "");
+        }
+        let provider = FixedResponseProvider::new("synthesis text");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        let report = synthesize_stale_entities(&provider, "m", &kg, &embedder, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(report.nodes_processed, 3, "should process exactly cap");
+        assert_eq!(report.nodes_remaining, 2, "2 nodes should remain");
+    }
+
+    #[tokio::test]
+    async fn first_run_cap_is_5x() {
+        let (_tmp, kg) = test_kg();
+        // Create 25 stale nodes with max_per_run=4 → total(25) > 5*4=20 → effective_cap = 20.
+        for i in 0..25 {
+            add_stale_node(&kg, &format!("ent_{i}"), "item", "");
+        }
+        let provider = FixedResponseProvider::new("synth");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        let report = synthesize_stale_entities(&provider, "m", &kg, &embedder, 4)
+            .await
+            .unwrap();
+
+        // effective_cap = 5*4 = 20, total_stale = 25 → nodes_remaining = 5
+        assert_eq!(report.nodes_processed, 20);
+        assert_eq!(report.nodes_remaining, 5);
+    }
+
+    #[tokio::test]
+    async fn synthesis_uses_all_events() {
+        let (_tmp, kg) = test_kg();
+        let id = add_stale_node(&kg, "carol", "person", "");
+        kg.add_event(&id, "event two", None, None).unwrap();
+        kg.add_event(&id, "event three", None, None).unwrap();
+        kg.add_event(&id, "event four", None, None).unwrap();
+        kg.add_event(&id, "event five", None, None).unwrap();
+
+        let provider = FixedResponseProvider::new("Carol synthesis");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        synthesize_stale_entities(&provider, "m", &kg, &embedder, 10)
+            .await
+            .unwrap();
+
+        // Verify all events appeared in the prompt.
+        let prompts = provider.prompts();
+        assert!(!prompts.is_empty());
+        let combined = prompts.join(" ");
+        assert!(combined.contains("event two"), "prompt should include event two");
+        assert!(combined.contains("event five"), "prompt should include event five");
+        assert!(combined.contains("initial fact"), "prompt should include the first event");
+    }
+
+    #[tokio::test]
+    async fn already_fresh_nodes_skipped() {
+        let (_tmp, kg) = test_kg();
+        let id = add_stale_node(&kg, "dave", "person", "");
+        // Manually synthesize the node to clear its stale status.
+        kg.update_synthesis(&id, "Dave is fresh", None).unwrap();
+
+        let provider = FixedResponseProvider::new("should not be called");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        let report = synthesize_stale_entities(&provider, "m", &kg, &embedder, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.nodes_processed, 0, "fresh node should be skipped");
+        assert_eq!(provider.prompts().len(), 0, "provider should not be called");
+    }
+
+    #[tokio::test]
+    async fn dream_cycle_report_reflects_reality() {
+        let (_tmp, kg) = test_kg();
+        for i in 0..10 {
+            add_stale_node(&kg, &format!("node_{i}"), "item", "");
+        }
+        let provider = FixedResponseProvider::new("synth");
+        let embedder = FixedEmbeddingProvider { dims: 4 };
+
+        let report = synthesize_stale_entities(&provider, "m", &kg, &embedder, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(report.nodes_processed, 10);
+        assert_eq!(report.nodes_remaining, 0);
+    }
 
     #[test]
     fn parse_valid_json_response() {

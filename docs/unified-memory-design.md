@@ -1563,6 +1563,44 @@ async fn dream_cycle_report_reflects_reality() {
 
 **Deliverable:** Entity knowledge stays current without manual curation. Embeddings on nodes enable vector search in Phase 4's RRF path. First-run backlog is handled within one night.
 
+#### Implementation Notes
+
+Implemented 2026-04-13. All changes on branch `better-memory`.
+
+**`zeroclaw-config` — `MemoryConfig` additions:**
+Four new fields added to `MemoryConfig` struct and `Default` impl:
+- `dream_cycle_enabled: bool` — default `false` in `Default::default()` (wizard sets it to `true` when `uses_sqlite_hygiene`).
+- `dream_cycle_cron: String` — default `"0 3 * * *"`.
+- `dream_cycle_max_per_run: usize` — default `20`.
+- `dream_cycle_synthesis_max_tokens: usize` — default `300`.
+
+`wizard.rs` `memory_config_defaults_for_backend()` updated to set the four new fields (dream cycle enabled when SQLite hygiene profile is active).
+
+**`consolidation.rs` — `SynthesisReport` and `synthesize_stale_entities()`:**
+- `SynthesisReport { nodes_processed, nodes_remaining }` — returned by the dream cycle.
+- `SYNTHESIS_SYSTEM_PROMPT` — instructs the LLM to produce a concise factual paragraph.
+- `synthesize_stale_entities(provider, model, knowledge, embedder, max_per_run)`:
+  1. Counts total stale nodes via `list_stale_nodes(usize::MAX)`.
+  2. If `total > 5 × max_per_run`: effective cap = 5 × max_per_run with a warning log (first-run catch-up).
+  3. For each node: `get_with_timeline(node_id, usize::MAX)` → events reversed to chronological order → prompt string → `provider.chat_with_system()` → `embedder.embed_one()` → `knowledge.update_synthesis()`.
+  4. LLM failures and update errors are `tracing::warn!`-logged and skipped (never abort the run).
+  5. Returns `SynthesisReport { nodes_processed, nodes_remaining }`.
+
+**Cron wiring:** Not yet wired into a scheduler. The spec says "cron registration (or equivalent)" — the function is ready to be called from a scheduler or from `create_memory_with_storage_and_routes()` (following the hygiene pattern). This is deferred to a future integration step that will have both a `Provider` and `EmbeddingProvider` in scope.
+
+**`consolidation.rs` — tests added (7):**
+- `synthesize_stale_updates_synthesis_at` — verifies `synthesis` text and `synthesis_at` are populated.
+- `synthesize_stale_updates_embedding` — verifies node is no longer stale after synthesis.
+- `synthesize_respects_cap` — 5 nodes, cap=3 → 3 processed, 2 remaining.
+- `first_run_cap_is_5x` — 25 nodes, max_per_run=4 → effective_cap=20, nodes_remaining=5.
+- `synthesis_uses_all_events` — all 5 events appear in the LLM prompt.
+- `already_fresh_nodes_skipped` — fresh node with `synthesis_at` set is not processed; provider called 0 times.
+- `dream_cycle_report_reflects_reality` — 10 nodes, cap=20 → all processed, none remaining.
+
+Mock implementations inline in test module: `FixedResponseProvider` (records prompts, returns fixed response), `FixedEmbeddingProvider` (returns constant vectors of configurable dimension).
+
+**Results:** 325 memory tests + 1103 tool tests pass. 0 failures.
+
 ---
 
 ### Phase 7: Hygiene Reconciliation

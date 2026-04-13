@@ -5289,6 +5289,21 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
 
+    // ── Dream Cycle (Phase 6) ─────────────────────────────────
+    /// Enable nightly entity synthesis (dream cycle).
+    /// Default: true when backend = sqlite.
+    #[serde(default)]
+    pub dream_cycle_enabled: bool,
+    /// Cron schedule for the dream cycle (default: 3am nightly).
+    #[serde(default = "default_dream_cycle_cron")]
+    pub dream_cycle_cron: String,
+    /// Max entity nodes synthesized per run (default: 20).
+    #[serde(default = "default_dream_cycle_max_per_run")]
+    pub dream_cycle_max_per_run: usize,
+    /// Max tokens for each synthesis LLM response (default: 300).
+    #[serde(default = "default_dream_cycle_synthesis_max_tokens")]
+    pub dream_cycle_synthesis_max_tokens: usize,
+
     // ── Qdrant backend options ─────────────────────────────────
     /// Configuration for Qdrant vector database backend.
     /// Only used when `backend = "qdrant"`.
@@ -5324,6 +5339,15 @@ fn default_rerank_threshold() -> usize {
 }
 fn default_fts_early_return_score() -> f64 {
     0.85
+}
+fn default_dream_cycle_cron() -> String {
+    "0 3 * * *".into()
+}
+fn default_dream_cycle_max_per_run() -> usize {
+    20
+}
+fn default_dream_cycle_synthesis_max_tokens() -> usize {
+    300
 }
 fn default_namespace() -> String {
     "default".into()
@@ -5417,6 +5441,10 @@ impl Default for MemoryConfig {
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
+            dream_cycle_enabled: false,
+            dream_cycle_cron: default_dream_cycle_cron(),
+            dream_cycle_max_per_run: default_dream_cycle_max_per_run(),
+            dream_cycle_synthesis_max_tokens: default_dream_cycle_synthesis_max_tokens(),
             qdrant: QdrantConfig::default(),
         }
     }
