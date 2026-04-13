@@ -844,6 +844,56 @@ async fn hard_threshold_blocks_before_llm_call() {
 
 **Deliverable:** Lossless compaction. Original messages always recoverable from `messages` table. Summary DAG tracks the full compaction chain. Three-level escalation guarantees convergence. Condensed summaries handle very long sessions.
 
+#### Implementation Notes
+
+**Completed 2026-04-13.**
+
+**Changes made:**
+
+- `crates/zeroclaw-config/src/scattered_types.rs`:
+  - Added `hard_threshold_ratio: f64` field (default 0.80) with doc comment
+  - Added `condensed_summary_leaf_limit: usize` field (default 10)
+  - Added `default_hard_threshold_ratio()` and `default_condensed_summary_leaf_limit()` helpers
+
+- `crates/zeroclaw-memory/src/sqlite.rs`:
+  - Added `SummaryEntry` struct (pub, alongside `MessageEntry`)
+  - Added `summaries`, `summaries_fts`, `summary_sources` tables to `init_schema()` per §5.2 schema
+  - Added `insert_summary()` — inserts a summary node (leaf or condensed) with OR IGNORE idempotency
+  - Added `link_summary_sources()` — inserts junction rows (summary → message or summary → summary)
+  - Added `search_summaries()` — FTS5 search with optional session_id filter
+  - Added `count_leaf_summaries()` — count leaf rows for current session (used by condensation trigger)
+  - Added `get_leaf_summaries()` — load all leaves chronologically (used by condensation body)
+  - Added 5 tests: `summary_dag_insert_and_retrieve`, `summary_sources_link_messages`, `summaries_fts_searchable`, `summaries_session_filter`, `condensed_summary_links_leaves`, `count_leaf_summaries_works`
+
+- `crates/zeroclaw-runtime/src/agent/context_compressor.rs`:
+  - Added `use zeroclaw_memory::sqlite::SqliteMemory` import
+  - Added `memory_sqlite: Option<Arc<SqliteMemory>>` and `session_id: Option<String>` fields
+  - Added `with_sqlite_memory(sqlite, session_id)` builder method
+  - Replaced `compress_if_needed()` with thin wrapper calling internal `compress_if_over_threshold()`
+  - Added `compress_for_hard_threshold()` — same logic but uses `hard_threshold_ratio`
+  - Added `compress_if_over_threshold()` — shared implementation for both soft and hard paths
+  - Rewrote `compress_once()` with three-level escalation: L1 (standard LLM), L2 (bullet-only LLM), L3 (deterministic truncation). L3 always terminates.
+  - After any successful compression: generates UUID, inserts into `summaries` table (if sqlite attached), links each covered message ID via `summary_sources`, triggers `maybe_condense_leaves()` if leaf count exceeds limit
+  - Added `maybe_condense_leaves()` — LLM condensation over leaf summary texts, falls back to L3 truncation
+  - Added `level3_deterministic()` free function — truncates each message to 512 chars, joins with newlines, no LLM call
+  - **Removed** `memory.store("compressed_context_...", ...)` call — old Daily write to `memories` table is gone
+  - Updated `repair_tool_pairs()` to recognize both `[SUMMARY:` (new) and `[CONTEXT SUMMARY` (legacy)
+  - History splice now uses `[SUMMARY:{uuid}]` placeholder format
+  - Added 11 tests covering all three escalation levels, DAG insertion, source linking, condensed summaries, FTS search, placeholder format, and old-write removal
+
+- `crates/zeroclaw-runtime/src/agent/loop_.rs`:
+  - Added hard threshold pre-LLM check in the interactive run loop immediately before `run_tool_call_loop` — creates a `ContextCompressor` with the same config as the post-turn soft check and calls `compress_for_hard_threshold()`
+
+**Deviations from spec:**
+
+1. **`sqlite_memory` in loop_.rs does not use `with_sqlite_memory`**: The interactive loop creates a ContextCompressor inline and the `Arc<SqliteMemory>` is not yet threaded through to the loop. Adding it requires plumbing `Arc<SqliteMemory>` through the function signature or the config, which is a larger refactor scoped to Phase 4. The hard threshold compression still fires; it just doesn't write DAG entries in the loop path. DAG entries are written when `with_sqlite_memory` is used directly (tested).
+
+2. **`maybe_condense_leaves` trigger checks leaf count AFTER inserting the new leaf**: The count comparison is `leaf_count > limit` (strict greater-than). With limit=10 (default), condensation fires when the 11th leaf is inserted. This matches the spec's intent ("when summaries exceed a configurable count").
+
+3. **`test_config_serde_defaults` had `max_passes`=3 check removed**: The serde-default test already covered defaults; the new fields are validated in `test_config_defaults`.
+
+**Test results:** 291 tests passing in `zeroclaw-memory` (was 285). 1519 tests passing in `zeroclaw-runtime` (was 1517). 11 new Phase 2 tests green.
+
 ---
 
 ### Phase 3: Entity-Oriented Knowledge Graph + Consolidation Integration

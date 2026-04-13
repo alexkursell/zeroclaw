@@ -2764,6 +2764,24 @@ pub async fn run(
                 }
             });
 
+            // Hard threshold check: compress before calling the LLM if history is
+            // above hard_threshold_ratio. This is a blocking safety net — Level 3
+            // always terminates if the LLM is unresponsive.
+            {
+                let compressor =
+                    crate::agent::context_compressor::ContextCompressor::new(
+                        config.agent.context_compression.clone(),
+                        config.agent.max_context_tokens,
+                    )
+                    .with_memory(mem.clone());
+                if let Err(e) = compressor
+                    .compress_for_hard_threshold(&mut history, provider.as_ref(), &model_name)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Hard-threshold compression failed");
+                }
+            }
+
             // Ctrl+C cancels the in-flight turn instead of killing the process.
             let cancel_token = CancellationToken::new();
             let cancel_token_clone = cancel_token.clone();

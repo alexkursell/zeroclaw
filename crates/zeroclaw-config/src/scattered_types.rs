@@ -181,6 +181,12 @@ fn default_identifier_policy() -> String {
 fn default_tool_result_retrim_chars() -> usize {
     2_000
 }
+fn default_hard_threshold_ratio() -> f64 {
+    0.80
+}
+fn default_condensed_summary_leaf_limit() -> usize {
+    10
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -188,8 +194,12 @@ fn default_tool_result_retrim_chars() -> usize {
 pub struct ContextCompressionConfig {
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
+    /// Soft threshold: compression checked between turns (non-blocking).
     #[serde(default = "default_threshold_ratio")]
     pub threshold_ratio: f64,
+    /// Hard threshold: compression checked immediately before each LLM call (blocking).
+    #[serde(default = "default_hard_threshold_ratio")]
+    pub hard_threshold_ratio: f64,
     #[serde(default = "default_protect_first_n")]
     pub protect_first_n: usize,
     #[serde(default = "default_protect_last_n")]
@@ -210,6 +220,9 @@ pub struct ContextCompressionConfig {
     pub tool_result_retrim_chars: usize,
     #[serde(default)]
     pub tool_result_trim_exempt: Vec<String>,
+    /// When leaf summary count for current session exceeds this, create a condensed summary.
+    #[serde(default = "default_condensed_summary_leaf_limit")]
+    pub condensed_summary_leaf_limit: usize,
 }
 
 impl Default for ContextCompressionConfig {
@@ -217,6 +230,7 @@ impl Default for ContextCompressionConfig {
         Self {
             enabled: default_cc_enabled(),
             threshold_ratio: default_threshold_ratio(),
+            hard_threshold_ratio: default_hard_threshold_ratio(),
             protect_first_n: default_protect_first_n(),
             protect_last_n: default_protect_last_n(),
             max_passes: default_cc_max_passes(),
@@ -227,6 +241,7 @@ impl Default for ContextCompressionConfig {
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
             tool_result_trim_exempt: Vec::new(),
+            condensed_summary_leaf_limit: default_condensed_summary_leaf_limit(),
         }
     }
 }

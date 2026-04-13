@@ -25,7 +25,18 @@ pub struct MessageEntry {
     pub role: String,
     pub content: String,
     pub created_at: String,
-    pub summary_id: Option<String>, // populated in Phase 2; always None for now
+    pub summary_id: Option<String>, // set when message has been covered by a summary
+}
+
+/// A row from the `summaries` table (Summary DAG node).
+pub struct SummaryEntry {
+    pub id: String,
+    pub kind: String,       // "leaf" | "condensed"
+    pub content: String,
+    pub session_id: String,
+    pub level: u32,         // escalation level: 1 | 2 | 3
+    pub created_at: String,
+    pub score: Option<f64>, // set during RRF search (Phase 4)
 }
 
 /// SQLite-backed persistent memory — the brain
@@ -232,7 +243,35 @@ impl SqliteMemory {
             );
             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;",
+            END;
+
+            -- Summary DAG nodes (Phase 2)
+            CREATE TABLE IF NOT EXISTS summaries (
+                id           TEXT PRIMARY KEY,
+                kind         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                token_count  INTEGER,
+                session_id   TEXT NOT NULL,
+                level        INTEGER NOT NULL DEFAULT 1,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
+                content, content=summaries, content_rowid=rowid
+            );
+            CREATE TRIGGER IF NOT EXISTS summaries_ai AFTER INSERT ON summaries BEGIN
+                INSERT INTO summaries_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+
+            -- Junction table: which messages/summaries does each summary cover?
+            CREATE TABLE IF NOT EXISTS summary_sources (
+                summary_id   TEXT NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
+                source_id    TEXT NOT NULL,
+                source_kind  TEXT NOT NULL,
+                PRIMARY KEY (summary_id, source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_summary_sources_source ON summary_sources(source_id);",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -390,6 +429,157 @@ impl SqliteMemory {
                 .collect()
         };
 
+        Ok(results)
+    }
+
+    // ── Summary DAG (Phase 2) ─────────────────────────────────────────────
+
+    /// Insert a new summary node. Returns Ok(()) on success.
+    /// `kind` must be "leaf" or "condensed".
+    pub fn insert_summary(
+        &self,
+        id: &str,
+        kind: &str,
+        content: &str,
+        token_count: Option<i64>,
+        session_id: &str,
+        level: u32,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let created_at = chrono::Local::now().to_rfc3339();
+        #[allow(clippy::cast_possible_wrap)]
+        conn.execute(
+            "INSERT OR IGNORE INTO summaries (id, kind, content, token_count, session_id, level, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, kind, content, token_count, session_id, level as i64, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Link a summary to the messages or summaries it covers.
+    /// `sources` is a slice of (source_id, source_kind) where source_kind is "message" or "summary".
+    pub fn link_summary_sources(
+        &self,
+        summary_id: &str,
+        sources: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        for (source_id, source_kind) in sources {
+            conn.execute(
+                "INSERT OR IGNORE INTO summary_sources (summary_id, source_id, source_kind)
+                 VALUES (?1, ?2, ?3)",
+                params![summary_id, source_id, source_kind],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// FTS5 search over summary content. Returns summaries ordered by recency.
+    pub fn search_summaries(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<SummaryEntry>> {
+        let fts_query: String = query
+            .split_whitespace()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| {
+            Ok(SummaryEntry {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                content: row.get(2)?,
+                session_id: row.get(3)?,
+                level: {
+                    let l: i64 = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    { l as u32 }
+                },
+                created_at: row.get(5)?,
+                score: None,
+            })
+        };
+
+        let results = if let Some(sid) = session_id {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.kind, s.content, s.session_id, s.level, s.created_at
+                 FROM summaries_fts f
+                 JOIN summaries s ON s.rowid = f.rowid
+                 WHERE summaries_fts MATCH ?1
+                   AND s.session_id = ?2
+                 ORDER BY s.created_at DESC
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![fts_query, sid, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.kind, s.content, s.session_id, s.level, s.created_at
+                 FROM summaries_fts f
+                 JOIN summaries s ON s.rowid = f.rowid
+                 WHERE summaries_fts MATCH ?1
+                 ORDER BY s.created_at DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![fts_query, limit_i64], row_mapper)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        };
+
+        Ok(results)
+    }
+
+    /// Count leaf summaries for a given session (used by condensed summary trigger).
+    pub fn count_leaf_summaries(&self, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM summaries WHERE session_id = ?1 AND kind = 'leaf'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(count as usize)
+    }
+
+    /// Get all leaf summaries for a session (for condensed summary creation).
+    pub fn get_leaf_summaries(&self, session_id: &str) -> anyhow::Result<Vec<SummaryEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, content, session_id, level, created_at
+             FROM summaries
+             WHERE session_id = ?1 AND kind = 'leaf'
+             ORDER BY created_at ASC",
+        )?;
+        let results = stmt
+            .query_map(params![session_id], |row| {
+                Ok(SummaryEntry {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    session_id: row.get(3)?,
+                    level: {
+                        let l: i64 = row.get(4)?;
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        { l as u32 }
+                    },
+                    created_at: row.get(5)?,
+                    score: None,
+                })
+            })?
+            .filter_map(std::result::Result::ok)
+            .collect();
         Ok(results)
     }
 
@@ -3025,5 +3215,138 @@ mod tests {
         assert_eq!(role_of("r-user"), "user");
         assert_eq!(role_of("r-assistant"), "assistant");
         assert_eq!(role_of("r-tool"), "tool");
+    }
+
+    // ── Phase 2: Summary DAG tests ────────────────────────────────────────
+
+    #[test]
+    fn summary_dag_insert_and_retrieve() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let id = "summary-001";
+        mem.insert_summary(id, "leaf", "User discussed Rust and async patterns", Some(10), "session-1", 1).unwrap();
+
+        let conn = mem.conn.lock();
+        let content: String = conn
+            .query_row("SELECT content FROM summaries WHERE id = ?1", params![id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "User discussed Rust and async patterns");
+
+        let kind: String = conn
+            .query_row("SELECT kind FROM summaries WHERE id = ?1", params![id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kind, "leaf");
+
+        let level: i64 = conn
+            .query_row("SELECT level FROM summaries WHERE id = ?1", params![id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(level, 1);
+    }
+
+    #[test]
+    fn summary_sources_link_messages() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Create messages first
+        mem.append_message("msg-1", "session-1", "user", "hello", None).unwrap();
+        mem.append_message("msg-2", "session-1", "assistant", "hi there", None).unwrap();
+
+        // Create summary
+        mem.insert_summary("sum-1", "leaf", "Greeting exchange", Some(5), "session-1", 1).unwrap();
+
+        // Link sources
+        mem.link_summary_sources("sum-1", &[("msg-1", "message"), ("msg-2", "message")]).unwrap();
+
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_sources WHERE summary_id = 'sum-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let source_id: String = conn
+            .query_row(
+                "SELECT source_id FROM summary_sources WHERE summary_id = 'sum-1' AND source_kind = 'message' ORDER BY source_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(source_id == "msg-1" || source_id == "msg-2");
+    }
+
+    #[test]
+    fn summaries_fts_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.insert_summary("sum-fts-1", "leaf", "User prefers Rust and tokio async", Some(8), "session-x", 1).unwrap();
+        mem.insert_summary("sum-fts-2", "leaf", "Discussed database schemas", Some(4), "session-x", 1).unwrap();
+
+        let results = mem.search_summaries("tokio", 10, None).unwrap();
+        assert!(!results.is_empty(), "FTS should find 'tokio'");
+        assert!(results.iter().any(|s| s.content.contains("tokio")));
+    }
+
+    #[test]
+    fn summaries_session_filter() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.insert_summary("sum-a", "leaf", "Rust async programming discussion", None, "session-a", 1).unwrap();
+        mem.insert_summary("sum-b", "leaf", "Rust ownership and borrowing discussion", None, "session-b", 1).unwrap();
+
+        let a_results = mem.search_summaries("Rust", 10, Some("session-a")).unwrap();
+        assert_eq!(a_results.len(), 1);
+        assert_eq!(a_results[0].id, "sum-a");
+
+        let b_results = mem.search_summaries("Rust", 10, Some("session-b")).unwrap();
+        assert_eq!(b_results.len(), 1);
+        assert_eq!(b_results[0].id, "sum-b");
+
+        let all_results = mem.search_summaries("Rust", 10, None).unwrap();
+        assert_eq!(all_results.len(), 2);
+    }
+
+    #[test]
+    fn condensed_summary_links_leaves() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Insert several leaf summaries
+        let leaf_ids = ["leaf-1", "leaf-2", "leaf-3"];
+        for id in &leaf_ids {
+            mem.insert_summary(id, "leaf", &format!("Leaf content for {id}"), None, "session-cond", 1).unwrap();
+        }
+
+        // Create condensed summary
+        mem.insert_summary("condensed-1", "condensed", "Overall summary of leaves", None, "session-cond", 1).unwrap();
+
+        let sources: Vec<(&str, &str)> = leaf_ids.iter().map(|id| (*id, "summary")).collect();
+        mem.link_summary_sources("condensed-1", &sources).unwrap();
+
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM summary_sources WHERE summary_id = 'condensed-1' AND source_kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "Condensed summary should link all 3 leaf summaries");
+    }
+
+    #[test]
+    fn count_leaf_summaries_works() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        assert_eq!(mem.count_leaf_summaries("session-new").unwrap(), 0);
+
+        mem.insert_summary("l1", "leaf", "leaf 1 content", None, "session-count", 1).unwrap();
+        mem.insert_summary("l2", "leaf", "leaf 2 content", None, "session-count", 2).unwrap();
+        mem.insert_summary("c1", "condensed", "condensed content", None, "session-count", 1).unwrap();
+
+        assert_eq!(mem.count_leaf_summaries("session-count").unwrap(), 2, "condensed not counted");
     }
 }
