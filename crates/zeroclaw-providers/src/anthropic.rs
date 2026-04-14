@@ -789,6 +789,12 @@ impl Provider for AnthropicProvider {
             stream: None,
         };
 
+        if tracing::enabled!(tracing::Level::TRACE) {
+            if let Ok(json) = serde_json::to_string(&request) {
+                tracing::trace!(payload = %json, "Anthropic full request payload");
+            }
+        }
+
         let mut request = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
@@ -860,6 +866,12 @@ impl Provider for AnthropicProvider {
             tool_choice,
             stream: None,
         };
+
+        if tracing::enabled!(tracing::Level::TRACE) {
+            if let Ok(json) = serde_json::to_string(&native_request) {
+                tracing::trace!(payload = %json, "Anthropic full request payload");
+            }
+        }
 
         let req = self
             .http_client()
@@ -1014,6 +1026,12 @@ impl Provider for AnthropicProvider {
             tool_choice,
             stream: Some(true),
         };
+
+        if tracing::enabled!(tracing::Level::TRACE) {
+            if let Ok(json) = serde_json::to_string(&native_request) {
+                tracing::trace!(payload = %json, "Anthropic full request payload");
+            }
+        }
 
         let body = Self::build_streaming_request(&native_request);
         let client = self.http_client();

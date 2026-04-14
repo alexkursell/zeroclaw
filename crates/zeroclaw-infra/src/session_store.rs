@@ -25,18 +25,30 @@ impl SessionStore {
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        let safe_key: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.sessions_dir.join(format!("{safe_key}.jsonl"))
+        self.sessions_dir
+            .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
+}
+
+/// Sanitize a session key to be safe for use as a filename.
+///
+/// Replaces any character that is not alphanumeric, `_`, or `-` with `_`.
+/// Matrix user/room IDs contain `@`, `:`, `!`, `.`, and `|` which would
+/// otherwise cause a mismatch between the key used at runtime and the
+/// filename read back by `list_sessions` on restart.
+pub fn sanitize_session_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+impl SessionStore {
 
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.

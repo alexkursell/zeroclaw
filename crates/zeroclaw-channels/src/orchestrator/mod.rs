@@ -70,6 +70,7 @@ pub use crate::whatsapp_web::WhatsAppWebChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+pub use zeroclaw_infra::session_store::sanitize_session_key;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
@@ -420,13 +421,20 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    //
+    // The key is sanitized via sanitize_session_key so it matches the filename
+    // that session_store writes to disk. Without this, list_sessions() returns
+    // sanitized filenames at startup (loaded into conversation_histories under
+    // the sanitized key) but runtime lookups use the raw unsanitized key —
+    // causing a miss and a fresh context on every restart.
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
@@ -3986,11 +3994,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .matrix
                     .as_ref()
                     .context("Matrix channel is not configured")?;
-                Ok(Arc::new(MatrixChannel::new(
+                Ok(Arc::new(MatrixChannel::new_full(
                     mx.homeserver.clone(),
                     mx.access_token.clone(),
                     mx.room_id.clone(),
                     mx.allowed_users.clone(),
+                    mx.allowed_rooms.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|p| p.to_path_buf()),
+                    mx.recovery_key.clone(),
                 )))
             }
             #[cfg(not(feature = "channel-matrix"))]
